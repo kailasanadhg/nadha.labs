@@ -1,28 +1,41 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   ETLAB PRO — YOUR ATTENDANCE BESTIE 🎓                                     ║
-║   v3.0 | Playwright-powered | Bulletproof | Teen-friendly analytics         ║
+║   ETLAB PRO — YOUR ATTENDANCE BUDDY 🎓                                     ║
+║   v4.0 | Playwright-powered | Bulletproof | Full Analytics                  ║
 ║   "know before you yolo the bunk" — the only attendance tool you need       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  FIXED IN v4.0:                                                              ║
+║   • Attendance subject page: pivot table parser (was reading roll no         ║
+║     UKP25CD030 as a subject with 381 classes — now correctly reads all       ║
+║     10 subjects from the wide-format table with present/total/%  per col)    ║
+║   • Results page: each widget-box section (Sessional, Module Test,           ║
+║     Assignments, Tutorials, Seminars) parsed separately with correct          ║
+║     column mapping — Maximum Marks / Marks Obtained no longer swapped        ║
+║   • batch_id discovery: now prefers long encoded IDs (32481378255) from      ║
+║     href patterns over short numeric IDs to avoid collision with student ID  ║
+║   • Subject name enrichment: codes from attendance table resolved to full    ║
+║     names via results data                                                    ║
+║   • Table formatter: max col width reduced, long subjects truncated cleanly  ║
+║   • Profile parser: now pulls Roll No from the attendance subject table      ║
+║   • Overall % now uses effective_present not just present                    ║
+║   • Duty leave and medical leave properly reflected in summary stats         ║
+║   • What-if simulator: works by subject code prefix too                      ║
+║   • New: per-subject series marks table with exam-wise breakdown             ║
+║   • New: risk prioritisation with weeks-to-safe calculation                  ║
+║   • New: attendance heatmap ASCII calendar per subject                       ║
+║   • New: --semester flag to switch semester without editing code             ║
+║   • New: graceful empty-table handling in results (no junk rows)             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-HOW IT WORKS:
-  1. Playwright launches a real browser (invisible) — no bot detection issues
-  2. Logs into EtLab using YOUR credentials
-  3. Intercepts all network requests to find hidden JSON APIs
-  4. Falls back to full HTML scraping if no APIs found
-  5. Runs analytics: bunk budget, detention risk, what-if simulator
-  6. Outputs color terminal dashboard + JSON + CSV + PNG charts
-
 INSTALL:
-  pip install playwright beautifulsoup4 pandas numpy matplotlib seaborn
+  pip install playwright beautifulsoup4 pandas numpy matplotlib seaborn lxml
   playwright install chromium
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPORTS — grouped by purpose
+# IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# stdlib
 import os
 import re
 import sys
@@ -31,30 +44,30 @@ import time
 import math
 import heapq
 import hashlib
-import logging
 import argparse
-import warnings
 import textwrap
 import traceback
-from datetime import datetime, timedelta, date
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any, Union, Iterator
-from dataclasses import dataclass, field, asdict
-from collections import defaultdict, OrderedDict, Counter, deque
-from functools import lru_cache, wraps
-from urllib.parse import urljoin, urlparse, urlencode, quote
-from enum import Enum, auto
-from contextlib import contextmanager
 import threading
-import queue
 import copy
+import calendar as cal_module
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Any
+from dataclasses import dataclass, field, asdict
+from collections import defaultdict, OrderedDict, deque
+from urllib.parse import urljoin
+from enum import Enum
 
-# third-party
 import warnings
 warnings.filterwarnings("ignore")
 
+# ── optional heavy deps ───────────────────────────────────────────────────────
+
 try:
-    from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, Response as PWResponse
+    from playwright.sync_api import (
+        sync_playwright, Page, Browser, BrowserContext,
+        Response as PWResponse,
+    )
     PLAYWRIGHT_OK = True
 except ImportError:
     PLAYWRIGHT_OK = False
@@ -78,11 +91,7 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     import matplotlib.gridspec as gridspec
-    from matplotlib.patches import FancyBboxPatch
-    from matplotlib.colors import LinearSegmentedColormap
-    import seaborn as sns
     MATPLOTLIB_OK = True
 except ImportError:
     MATPLOTLIB_OK = False
@@ -93,66 +102,54 @@ try:
 except ImportError:
     SCIPY_OK = False
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TERMINAL COLORS — works without rich library
+# ANSI COLORS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
-    """ANSI color codes. Auto-disabled on Windows CMD."""
-    _ok = sys.stdout.isatty() or os.name != 'nt'
+    """ANSI color codes. Auto-disabled on non-TTY."""
+    _ok = sys.stdout.isatty()
 
-    RESET   = "\033[0m"   if _ok else ""
-    BOLD    = "\033[1m"   if _ok else ""
-    DIM     = "\033[2m"   if _ok else ""
-    ITALIC  = "\033[3m"   if _ok else ""
-
-    BLACK   = "\033[30m"  if _ok else ""
-    RED     = "\033[31m"  if _ok else ""
-    GREEN   = "\033[32m"  if _ok else ""
-    YELLOW  = "\033[33m"  if _ok else ""
-    BLUE    = "\033[34m"  if _ok else ""
-    MAGENTA = "\033[35m"  if _ok else ""
-    CYAN    = "\033[36m"  if _ok else ""
-    WHITE   = "\033[37m"  if _ok else ""
-
-    BRED    = "\033[91m"  if _ok else ""
-    BGREEN  = "\033[92m"  if _ok else ""
-    BYELLOW = "\033[93m"  if _ok else ""
-    BBLUE   = "\033[94m"  if _ok else ""
-    BMAGENTA= "\033[95m"  if _ok else ""
-    BCYAN   = "\033[96m"  if _ok else ""
-    BWHITE  = "\033[97m"  if _ok else ""
-
-    BG_RED    = "\033[41m" if _ok else ""
-    BG_GREEN  = "\033[42m" if _ok else ""
-    BG_YELLOW = "\033[43m" if _ok else ""
-    BG_BLUE   = "\033[44m" if _ok else ""
+    RESET    = "\033[0m"   if _ok else ""
+    BOLD     = "\033[1m"   if _ok else ""
+    DIM      = "\033[2m"   if _ok else ""
+    BRED     = "\033[91m"  if _ok else ""
+    BGREEN   = "\033[92m"  if _ok else ""
+    BYELLOW  = "\033[93m"  if _ok else ""
+    BBLUE    = "\033[94m"  if _ok else ""
+    BMAGENTA = "\033[95m"  if _ok else ""
+    BCYAN    = "\033[96m"  if _ok else ""
 
     @staticmethod
     def wrap(text: str, *codes: str) -> str:
         return "".join(codes) + str(text) + C.RESET
 
     @staticmethod
-    def green(t):  return C.wrap(t, C.BGREEN)
+    def green(t):   return C.wrap(t, C.BGREEN)
     @staticmethod
-    def red(t):    return C.wrap(t, C.BRED)
+    def red(t):     return C.wrap(t, C.BRED)
     @staticmethod
-    def yellow(t): return C.wrap(t, C.BYELLOW)
+    def yellow(t):  return C.wrap(t, C.BYELLOW)
     @staticmethod
-    def cyan(t):   return C.wrap(t, C.BCYAN)
+    def cyan(t):    return C.wrap(t, C.BCYAN)
     @staticmethod
-    def magenta(t):return C.wrap(t, C.BMAGENTA)
+    def magenta(t): return C.wrap(t, C.BMAGENTA)
     @staticmethod
-    def bold(t):   return C.wrap(t, C.BOLD)
+    def bold(t):    return C.wrap(t, C.BOLD)
     @staticmethod
-    def dim(t):    return C.wrap(t, C.DIM)
+    def dim(t):     return C.wrap(t, C.DIM)
     @staticmethod
-    def blue(t):   return C.wrap(t, C.BBLUE)
+    def blue(t):    return C.wrap(t, C.BBLUE)
 
 
-def _box(lines: List[str], title: str = "", width: int = 70, color=None) -> str:
+def _strip_ansi(s: str) -> str:
+    return re.sub(r'\033\[[0-9;]*m', '', s)
+
+
+def _box(lines: List[str], title: str = "", width: int = 72, color=None) -> str:
     """Draw a Unicode box around lines."""
-    color = color or C.CYAN
+    color = color or C.BCYAN
     inner = width - 2
     top    = f"{color}╔{'═' * inner}╗{C.RESET}"
     bottom = f"{color}╚{'═' * inner}╝{C.RESET}"
@@ -162,48 +159,43 @@ def _box(lines: List[str], title: str = "", width: int = 70, color=None) -> str:
         result.append(f"{color}║{C.BOLD}{padded}{C.RESET}{color}║{C.RESET}")
         result.append(f"{color}╠{'═' * inner}╣{C.RESET}")
     for line in lines:
-        # strip ANSI for length calc
-        clean = re.sub(r'\033\[[0-9;]*m', '', line)
+        clean = _strip_ansi(line)
         pad = inner - len(clean)
         result.append(f"{color}║{C.RESET} {line}{' ' * max(0, pad - 1)}{color}║{C.RESET}")
     result.append(bottom)
     return "\n".join(result)
 
 
-def _table(headers: List[str], rows: List[List[str]], col_widths: List[int] = None) -> str:
-    """Simple terminal table renderer."""
+def _table(headers: List[str], rows: List[List[str]],
+           col_widths: List[int] = None, max_col: int = 30) -> str:
+    """Terminal table with capped column widths to avoid line-wrap chaos."""
     if not rows:
         return C.dim("  (no data)")
 
     if not col_widths:
         col_widths = []
         for i, h in enumerate(headers):
-            max_w = len(re.sub(r'\033\[[0-9;]*m', '', h))
+            max_w = len(_strip_ansi(h))
             for row in rows:
                 if i < len(row):
-                    cell_len = len(re.sub(r'\033\[[0-9;]*m', '', str(row[i])))
-                    max_w = max(max_w, cell_len)
-            col_widths.append(min(max_w + 2, 40))
+                    max_w = max(max_w, len(_strip_ansi(str(row[i]))))
+            col_widths.append(min(max_w + 2, max_col))
 
     def make_row(cells, sep="│", pad=" "):
         parts = []
         for i, cell in enumerate(cells):
-            w = col_widths[i] if i < len(col_widths) else 10
-            clean_len = len(re.sub(r'\033\[[0-9;]*m', '', str(cell)))
-            padding = w - clean_len
-            parts.append(f"{pad}{cell}{pad * max(0, padding - 1)}")
+            w   = col_widths[i] if i < len(col_widths) else 10
+            cl  = len(_strip_ansi(str(cell)))
+            pad_right = max(0, w - cl - 1)
+            parts.append(f"{pad}{cell}{' ' * pad_right}")
         return sep + sep.join(parts) + sep
 
-    separator = "├" + "┼".join("─" * (w + 1) for w in col_widths) + "┤"
-    top_line  = "┌" + "┬".join("─" * (w + 1) for w in col_widths) + "┐"
-    bot_line  = "└" + "┴".join("─" * (w + 1) for w in col_widths) + "┘"
+    sep_row  = "├" + "┼".join("─" * (w + 1) for w in col_widths) + "┤"
+    top_line = "┌" + "┬".join("─" * (w + 1) for w in col_widths) + "┐"
+    bot_line = "└" + "┴".join("─" * (w + 1) for w in col_widths) + "┘"
 
-    colored_headers = [C.bold(C.cyan(h)) for h in headers]
-    lines = [
-        top_line,
-        make_row(colored_headers),
-        separator,
-    ]
+    colored_h = [C.bold(C.cyan(h)) for h in headers]
+    lines = [top_line, make_row(colored_h), sep_row]
     for row in rows:
         lines.append(make_row([str(c) for c in row]))
     lines.append(bot_line)
@@ -211,98 +203,97 @@ def _table(headers: List[str], rows: List[List[str]], col_widths: List[int] = No
 
 
 def _progress_bar(value: float, width: int = 20, show_pct: bool = True) -> str:
-    """Render a colored ASCII progress bar."""
-    pct = max(0.0, min(100.0, value))
+    pct    = max(0.0, min(100.0, value))
     filled = int(width * pct / 100)
     empty  = width - filled
-
-    if pct >= 75:
-        bar_color = C.BGREEN
-    elif pct >= 60:
-        bar_color = C.BYELLOW
-    else:
-        bar_color = C.BRED
-
-    bar = f"{bar_color}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
-    suffix = f" {bar_color}{pct:.1f}%{C.RESET}" if show_pct else ""
+    color  = C.BGREEN if pct >= 75 else (C.BYELLOW if pct >= 60 else C.BRED)
+    bar    = f"{color}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
+    suffix = f" {color}{pct:.1f}%{C.RESET}" if show_pct else ""
     return f"[{bar}]{suffix}"
 
 
 def _spinner(msg: str = "Loading"):
-    """Simple non-blocking spinner context manager."""
-    frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-    stop_event = threading.Event()
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    stop   = threading.Event()
 
     def spin():
         i = 0
-        while not stop_event.is_set():
-            sys.stdout.write(f"\r{C.CYAN}{frames[i % len(frames)]}{C.RESET} {msg}   ")
+        while not stop.is_set():
+            sys.stdout.write(f"\r{C.BCYAN}{frames[i % len(frames)]}{C.RESET} {msg}   ")
             sys.stdout.flush()
             time.sleep(0.1)
             i += 1
         sys.stdout.write("\r" + " " * (len(msg) + 10) + "\r")
         sys.stdout.flush()
 
-    t = threading.Thread(target=spin, daemon=True)
-    t.start()
-    return stop_event
+    threading.Thread(target=spin, daemon=True).start()
+    return stop
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
+# LOGGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabLogger:
-    """Custom logger with emoji + color prefixes. Gen-Z friendly."""
-
     LEVELS = {"DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3, "CRITICAL": 4}
 
     def __init__(self, level: str = "INFO", log_file: Optional[Path] = None):
-        self.level = self.LEVELS.get(level.upper(), 1)
+        self.level    = self.LEVELS.get(level.upper(), 1)
         self.log_file = log_file
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
         if log_file:
             log_file.parent.mkdir(parents=True, exist_ok=True)
+            log_file.write_text("", encoding="utf-8")   # fresh log each run
 
-    def _write(self, level: str, emoji: str, color, msg: str):
+    def _write(self, level: str, emoji: str, color_fn, msg: str):
         if self.LEVELS.get(level, 0) < self.level:
             return
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"{C.dim(ts)} {color(emoji + ' ' + msg)}"
+        ts   = datetime.now().strftime("%H:%M:%S")
+        line = f"{C.dim(ts)} {color_fn(emoji + ' ' + msg)}"
         with self._lock:
             print(line)
             if self.log_file:
-                clean = re.sub(r'\033\[[0-9;]*m', '', line)
+                clean = _strip_ansi(line)
                 with open(self.log_file, "a", encoding="utf-8") as f:
                     f.write(clean + "\n")
 
-    def debug(self, msg):    self._write("DEBUG", "🔍", C.dim, msg)
-    def info(self, msg):     self._write("INFO",  "ℹ️ ", C.cyan, msg)
-    def success(self, msg):  self._write("INFO",  "✅", C.green, msg)
-    def warn(self, msg):     self._write("WARN",  "⚠️ ", C.yellow, msg)
-    def error(self, msg):    self._write("ERROR", "❌", C.red, msg)
-    def critical(self, msg): self._write("CRITICAL", "💀", C.red, msg)
-    def vibe(self, msg):     self._write("INFO",  "🔥", C.magenta, msg)
+    def debug(self, m):    self._write("DEBUG",    "🔍", C.dim,     m)
+    def info(self, m):     self._write("INFO",     "ℹ️ ", C.cyan,    m)
+    def success(self, m):  self._write("INFO",     "✅", C.green,   m)
+    def warn(self, m):     self._write("WARN",     "⚠️ ", C.yellow,  m)
+    def error(self, m):    self._write("ERROR",    "❌", C.red,     m)
+    def critical(self, m): self._write("CRITICAL", "💀", C.red,     m)
+    def vibe(self, m):     self._write("INFO",     "🔥", C.magenta, m)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-BASE_URL    = "https://ukfcet.etlab.app"
-OUTPUT_DIR  = Path("etlab_output")
-CACHE_DIR   = OUTPUT_DIR / ".cache"
-LOG_FILE    = OUTPUT_DIR / "etlab.log"
+BASE_URL         = "https://ukfcet.etlab.app"
+OUTPUT_DIR       = Path("etlab_output")
+CACHE_DIR        = OUTPUT_DIR / ".cache"
+LOG_FILE         = OUTPUT_DIR / "etlab.log"
+SAFE_THRESHOLD   = 75.0
+DANGER_THRESHOLD = 60.0
 
-SAFE_THRESHOLD   = 75.0   # minimum attendance %
-DANGER_THRESHOLD = 60.0   # really in trouble zone
+# Non-subject column names in the pivot attendance table — skip these
+ATTENDANCE_TABLE_SKIP_COLS = {
+    "uni reg no", "unireg no", "reg no", "registration",
+    "roll no", "rollno", "roll",
+    "name", "student name",
+    "total", "percentage", "%",
+}
 
-# All known endpoint patterns — will be tried in order
-ENDPOINT_PATTERNS = {
-    "login":              ["/user/login"],
-    "dashboard":          ["/user/dashboard", "/dashboard", "/student/dashboard"],
-    "profile":            ["/student/profile", "/ktuacademics/student/profile"],
-    "attendance_date":    ["/ktuacademics/student/attendance", "/student/attendance"],
+# Endpoint patterns tried in order — {batch_id} filled at runtime
+ENDPOINT_PATTERNS: Dict[str, List[str]] = {
+    "login":    ["/user/login"],
+    "dashboard": ["/user/dashboard", "/dashboard", "/student/dashboard"],
+    "profile":  ["/student/profile", "/ktuacademics/student/profile"],
+    "attendance_date": [
+        "/ktuacademics/student/attendance",
+        "/student/attendance",
+    ],
     "attendance_subject": [
         "/ktuacademics/student/viewattendancesubject/{batch_id}",
         "/student/viewattendancesubject/{batch_id}",
@@ -310,55 +301,45 @@ ENDPOINT_PATTERNS = {
     "attendance_month": [
         "/ktuacademics/student/viewsubjectattendancemonth/{batch_id}",
     ],
-    "results":     ["/student/results", "/ktuacademics/student/results"],
-    "timetable":   ["/student/timetable", "/ktuacademics/student/timetable"],
-    "assignments": ["/student/assignments"],
+    "results":   ["/student/results", "/ktuacademics/student/results"],
+    "timetable": ["/student/timetable", "/ktuacademics/student/timetable"],
 }
 
-# API patterns to intercept (JSON endpoints the frontend might call)
 API_INTERCEPT_PATTERNS = [
-    r"/api/",
-    r"\.json",
-    r"/attendance/data",
-    r"/student/data",
-    r"format=json",
-    r"type=json",
+    r"/api/", r"\.json", r"/attendance/data", r"format=json", r"type=json",
 ]
 
-# Status class name variations across EtLab versions
-PRESENT_CLASSES  = {"present", "att_present", "att-present", "p", "green", "success"}
-ABSENT_CLASSES   = {"absent", "att_absent", "att-absent", "a", "red", "danger", "failure"}
-DUTY_CLASSES     = {"duty", "duty_leave", "dutyleave", "dl", "yellow", "warning", "info"}
-MEDICAL_CLASSES  = {"medical", "medical_leave", "ml", "blue", "primary"}
+PRESENT_CLASSES = {"present", "att_present", "att-present", "p", "green", "success"}
+ABSENT_CLASSES  = {"absent",  "att_absent",  "att-absent",  "a", "red",   "danger", "failure"}
+DUTY_CLASSES    = {"duty", "duty_leave", "dutyleave", "dl", "yellow", "warning", "info"}
+MEDICAL_CLASSES = {"medical", "medical_leave", "ml", "blue", "primary"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA MODELS — Pydantic-style with full validation
+# DATA MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AttendanceStatus(Enum):
-    PRESENT      = "present"
-    ABSENT       = "absent"
-    DUTY_LEAVE   = "duty_leave"
-    MEDICAL      = "medical_leave"
-    HOLIDAY      = "holiday"
-    UNKNOWN      = "unknown"
+    PRESENT    = "present"
+    ABSENT     = "absent"
+    DUTY_LEAVE = "duty_leave"
+    MEDICAL    = "medical_leave"
+    HOLIDAY    = "holiday"
+    UNKNOWN    = "unknown"
 
     @classmethod
     def from_classes(cls, class_list: List[str]) -> "AttendanceStatus":
-        """Detect status from CSS class list."""
         combined = " ".join(class_list).lower()
-        if any(c in combined for c in PRESENT_CLASSES):
-            return cls.PRESENT
-        if any(c in combined for c in ABSENT_CLASSES):
-            return cls.ABSENT
-        if any(c in combined for c in DUTY_CLASSES):
-            return cls.DUTY_LEAVE
-        if any(c in combined for c in MEDICAL_CLASSES):
-            return cls.MEDICAL
-        if "holiday" in combined:
-            return cls.HOLIDAY
+        if any(c in combined for c in PRESENT_CLASSES):  return cls.PRESENT
+        if any(c in combined for c in ABSENT_CLASSES):   return cls.ABSENT
+        if any(c in combined for c in DUTY_CLASSES):     return cls.DUTY_LEAVE
+        if any(c in combined for c in MEDICAL_CLASSES):  return cls.MEDICAL
+        if "holiday" in combined:                        return cls.HOLIDAY
         return cls.UNKNOWN
+
+    @property
+    def counts_as_present(self) -> bool:
+        return self in (self.PRESENT, self.DUTY_LEAVE, self.MEDICAL)
 
     @property
     def emoji(self) -> str:
@@ -370,10 +351,6 @@ class AttendanceStatus(Enum):
             self.HOLIDAY:    "🎉",
             self.UNKNOWN:    "❓",
         }[self]
-
-    @property
-    def counts_as_present(self) -> bool:
-        return self in (self.PRESENT, self.DUTY_LEAVE, self.MEDICAL)
 
 
 @dataclass
@@ -397,7 +374,10 @@ class AttendanceRecord:
 class SubjectAttendance:
     """
     Full attendance analytics for one subject.
-    Uses mathematical formulae for bunk budget calculations.
+
+    Bunk budget formula:
+      can_bunk:  floor((4P - 3T) / 3)   where P = effective_present, T = total
+      need_more: ceil((0.75T - P) / 0.25)  when P/T < 0.75
     """
     code:          str
     name:          str
@@ -410,23 +390,18 @@ class SubjectAttendance:
     dates_absent:  List[str] = field(default_factory=list)
     topics:        List[str] = field(default_factory=list)
 
-    # ── computed properties ─────────────────────────────────────────────
-
     @property
     def effective_present(self) -> int:
-        """Present + duty + medical (all count toward attendance)."""
         return self.present + self.duty_leave + self.medical_leave
 
     @property
     def percentage(self) -> float:
-        """Official attendance % (effective / total)."""
         if self.total_classes == 0:
             return 0.0
         return round(self.effective_present / self.total_classes * 100, 2)
 
     @property
     def raw_percentage(self) -> float:
-        """Physical attendance % (only actual present)."""
         if self.total_classes == 0:
             return 0.0
         return round(self.present / self.total_classes * 100, 2)
@@ -441,156 +416,116 @@ class SubjectAttendance:
 
     @property
     def status_emoji(self) -> str:
-        if self.is_safe:    return "✅"
-        if self.is_danger:  return "💀"
+        if self.is_safe:   return "✅"
+        if self.is_danger: return "💀"
         return "⚠️"
 
     @property
     def classes_to_attend(self) -> int:
-        """
-        Min classes to attend consecutively to hit 75%.
-        Solve: (present + x) / (total + x) >= 0.75
-        => x >= (0.75*total - present) / 0.25
-        => x >= 3*total - 4*present
-        """
         if self.is_safe:
             return 0
         p = self.effective_present
         t = self.total_classes
-        needed = math.ceil((0.75 * t - p) / 0.25)
-        return max(0, needed)
+        return max(0, math.ceil((0.75 * t - p) / 0.25))
 
     @property
     def classes_can_bunk(self) -> int:
-        """
-        Max classes that can be skipped while staying >= 75%.
-        Solve: present / (total + x) >= 0.75
-        => x <= present/0.75 - total
-        => x <= (4*present - 3*total) / 3
-        """
         if not self.is_safe:
             return 0
         p = self.effective_present
         t = self.total_classes
-        can = math.floor((4 * p - 3 * t) / 3)
-        return max(0, can)
+        return max(0, math.floor((4 * p - 3 * t) / 3))
 
     @property
     def shortage(self) -> int:
-        """How many classes short of 75% requirement."""
         if self.is_safe:
             return 0
-        required = math.ceil(0.75 * self.total_classes)
-        return max(0, required - self.effective_present)
+        return max(0, math.ceil(0.75 * self.total_classes) - self.effective_present)
 
     @property
     def vibe_check(self) -> str:
-        """Gen-Z style status message."""
         pct = self.percentage
-        if pct == 100:
-            return "absolutely unhinged nerd behavior 🤓"
-        elif pct >= 90:
-            return "professor's favorite fr fr"
-        elif pct >= 80:
-            return "solid, no cap"
-        elif pct >= 75:
-            return f"safe but on thin ice 🧊 ({self.classes_can_bunk} bunks left)"
-        elif pct >= 65:
-            return f"bestie you need to attend {self.classes_to_attend} more rn"
-        elif pct >= 50:
-            return "bro is cooked 💀 start attending"
-        else:
-            return "actually cooked. detention speedrun any%"
+        if pct == 100:  return "absolutely unhinged nerd behavior 🤓"
+        if pct >= 90:   return "professor's favorite fr fr 🏆"
+        if pct >= 80:   return "solid, no cap ✨"
+        if pct >= 75:   return f"safe but thin ice 🧊 ({self.classes_can_bunk} bunks left)"
+        if pct >= 65:   return f"attend {self.classes_to_attend} more rn bestie ⚠️"
+        if pct >= 50:   return "bro is cooked 💀 start attending"
+        return              "detention speedrun any% 🚨"
 
     def predict_after_n_classes(self, n_total: int, n_attend: int) -> float:
-        """
-        What-if simulator: predict % after n_total more classes
-        assuming you attend n_attend of them.
-        """
         new_p = self.effective_present + n_attend
         new_t = self.total_classes + n_total
         return round(new_p / new_t * 100, 2) if new_t > 0 else 0.0
 
     def weeks_until_safe(self, classes_per_week: int = 6) -> Optional[int]:
-        """If at risk, estimate weeks of full attendance to reach 75%."""
         if self.is_safe:
             return 0
-        needed = self.classes_to_attend
         if classes_per_week <= 0:
             return None
-        return math.ceil(needed / classes_per_week)
+        return math.ceil(self.classes_to_attend / classes_per_week)
 
     def to_dict(self) -> dict:
         return {
-            "code": self.code,
-            "name": self.name,
+            "code": self.code, "name": self.name,
             "total_classes": self.total_classes,
-            "present": self.present,
-            "absent": self.absent,
-            "duty_leave": self.duty_leave,
-            "medical_leave": self.medical_leave,
+            "present": self.present, "absent": self.absent,
+            "duty_leave": self.duty_leave, "medical_leave": self.medical_leave,
             "effective_present": self.effective_present,
-            "percentage": self.percentage,
-            "raw_percentage": self.raw_percentage,
-            "is_safe": self.is_safe,
-            "is_danger": self.is_danger,
+            "percentage": self.percentage, "raw_percentage": self.raw_percentage,
+            "is_safe": self.is_safe, "is_danger": self.is_danger,
             "classes_to_attend": self.classes_to_attend,
             "classes_can_bunk": self.classes_can_bunk,
             "shortage": self.shortage,
             "dates_present": self.dates_present,
             "dates_absent": self.dates_absent,
-            "topics": self.topics,
-            "vibe_check": self.vibe_check,
+            "topics": self.topics, "vibe_check": self.vibe_check,
         }
 
 
 @dataclass
 class StudentProfile:
-    name:           str = ""
-    student_id:     str = ""
-    roll_number:    str = ""
-    department:     str = ""
-    semester:       str = ""
-    batch:          str = ""
-    college:        str = ""
-    email:          str = ""
-    phone:          str = ""
-    batch_id:       str = ""
-    student_db_id:  str = ""
-    photo_url:      str = ""
+    name:          str = ""
+    student_id:    str = ""
+    roll_number:   str = ""
+    reg_number:    str = ""        # UKP25CD030-style university reg no
+    department:    str = ""
+    semester:      str = ""
+    batch:         str = ""
+    college:       str = ""
+    email:         str = ""
+    phone:         str = ""
+    batch_id:      str = ""
+    student_db_id: str = ""
 
     @property
     def display_name(self) -> str:
         return self.name or self.student_id or "Unknown Student"
 
-    @property
-    def is_complete(self) -> bool:
-        return bool(self.name and self.department)
-
 
 @dataclass
-class ExamResult:
-    exam_name:       str
+class SeriesExam:
+    """One row from the sessional / module-test / assignment table."""
+    category:        str   # "Sessional" | "Module Test" | "Assignment" | …
     subject_code:    str
     subject_name:    str
-    marks_obtained:  str
+    semester:        str
+    exam_label:      str   # "1", "2", "Assignment 1", …
     max_marks:       str
-    grade:           str
-    credits:         str
-    result:          str
+    marks_obtained:  str
 
     @property
-    def is_pass(self) -> bool:
-        return "pass" in self.result.lower() if self.result else False
+    def percentage(self) -> Optional[float]:
+        try:
+            return round(float(self.marks_obtained) / float(self.max_marks) * 100, 1)
+        except (ValueError, ZeroDivisionError):
+            return None
 
     @property
-    def grade_points(self) -> float:
-        """Convert letter grade to GPA points (KTU scale)."""
-        grade_map = {
-            "S": 10, "A+": 9, "A": 8.5, "B+": 8,
-            "B": 7, "C+": 6.5, "C": 6, "D": 5, "F": 0, "FE": 0
-        }
-        return grade_map.get(self.grade.upper(), 0.0)
+    def is_submitted(self) -> bool:
+        return self.marks_obtained.strip().upper() not in (
+            "", "NOT SUBMITTED", "RESULTS NOT PUBLISHED", "N/A", "-"
+        )
 
 
 @dataclass
@@ -601,33 +536,28 @@ class TimetableSlot:
     subject_name: str
     start_time:   str = ""
     end_time:     str = ""
-    room:         str = ""
 
 
 @dataclass
 class ScrapedPage:
-    """Stores raw page data for debugging."""
     url:        str
     html:       str
     fetched_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    method:     str = "playwright"  # playwright | requests
+    method:     str = "playwright"
     status:     int = 200
-
-    def save(self, path: Path):
-        path.write_text(self.html, encoding="utf-8", errors="replace")
 
 
 @dataclass
 class AcademicData:
-    profile:            StudentProfile = field(default_factory=StudentProfile)
-    attendance_records: List[AttendanceRecord] = field(default_factory=list)
-    subject_attendance: Dict[str, SubjectAttendance] = field(default_factory=dict)
-    results:            List[ExamResult] = field(default_factory=list)
-    timetable:          List[TimetableSlot] = field(default_factory=list)
-    scraped_pages:      Dict[str, ScrapedPage] = field(default_factory=dict)
-    api_data:           Dict[str, Any] = field(default_factory=dict)
-    scraped_at:         str = field(default_factory=lambda: datetime.now().isoformat())
-    errors:             List[str] = field(default_factory=list)
+    profile:            StudentProfile                = field(default_factory=StudentProfile)
+    attendance_records: List[AttendanceRecord]        = field(default_factory=list)
+    subject_attendance: Dict[str, SubjectAttendance]  = field(default_factory=dict)
+    series_results:     List[SeriesExam]              = field(default_factory=list)
+    timetable:          List[TimetableSlot]           = field(default_factory=list)
+    scraped_pages:      Dict[str, ScrapedPage]        = field(default_factory=dict)
+    api_data:           Dict[str, Any]                = field(default_factory=dict)
+    scraped_at:         str                           = field(default_factory=lambda: datetime.now().isoformat())
+    errors:             List[str]                     = field(default_factory=list)
 
     def add_error(self, msg: str):
         self.errors.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -638,19 +568,16 @@ class AcademicData:
 
     @property
     def has_results(self) -> bool:
-        return bool(self.results)
+        return bool(self.series_results)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DSA UTILITIES — advanced data structures used throughout
+# DSA UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LRUCache:
-    """
-    O(1) get/put LRU Cache using OrderedDict.
-    Used to cache parsed pages and avoid re-parsing.
-    """
-    def __init__(self, capacity: int = 50):
+    """O(1) get/put using OrderedDict."""
+    def __init__(self, capacity: int = 100):
         self._cache: OrderedDict = OrderedDict()
         self._cap = capacity
 
@@ -672,48 +599,41 @@ class LRUCache:
 
 
 class Trie:
-    """
-    Prefix Trie for fast subject name lookup and fuzzy matching.
-    Handles abbreviations like "MATH" → "MATHEMATICS FOR..."
-    """
+    """Prefix trie for fast subject lookup + Levenshtein fuzzy match."""
     def __init__(self):
         self._root: Dict = {}
         self._subjects: List[str] = []
 
     def insert(self, subject: str):
         node = self._root
-        for char in subject.upper():
-            node = node.setdefault(char, {})
+        for ch in subject.upper():
+            node = node.setdefault(ch, {})
         node["$"] = subject
         self._subjects.append(subject)
 
     def search_prefix(self, prefix: str) -> List[str]:
-        """Return all subjects starting with prefix."""
         node = self._root
-        for char in prefix.upper():
-            if char not in node:
+        for ch in prefix.upper():
+            if ch not in node:
                 return []
-            node = node[char]
+            node = node[ch]
         return self._collect(node)
 
     def _collect(self, node: Dict) -> List[str]:
-        results = []
+        res = []
         if "$" in node:
-            results.append(node["$"])
-        for key, child in node.items():
-            if key != "$":
-                results.extend(self._collect(child))
-        return results
+            res.append(node["$"])
+        for k, child in node.items():
+            if k != "$":
+                res.extend(self._collect(child))
+        return res
 
     def fuzzy_find(self, query: str, max_results: int = 5) -> List[Tuple[float, str]]:
-        """Find closest subjects using edit distance + prefix scoring."""
-        scored = []
         q = query.upper()
+        scored = []
         for subject in self._subjects:
             s = subject.upper()
-            # Levenshtein distance (DP)
             dist = self._levenshtein(q, s[:len(q) + 5])
-            # Prefix bonus
             prefix_score = len(os.path.commonprefix([q, s])) / max(len(q), 1)
             score = prefix_score - (dist / max(len(q), len(s), 1)) * 0.5
             scored.append((score, subject))
@@ -722,23 +642,19 @@ class Trie:
 
     @staticmethod
     def _levenshtein(a: str, b: str) -> int:
-        """Standard DP Levenshtein distance O(m*n)."""
         m, n = len(a), len(b)
         dp = list(range(n + 1))
         for i in range(1, m + 1):
             prev = dp[:]
             dp[0] = i
             for j in range(1, n + 1):
-                cost = 0 if a[i-1] == b[j-1] else 1
-                dp[j] = min(dp[j] + 1, dp[j-1] + 1, prev[j-1] + cost)
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev[j - 1] + cost)
         return dp[n]
 
 
 class MinHeap:
-    """
-    Min-heap wrapper for priority-queue operations.
-    Used to rank subjects by risk level (lowest attendance = highest priority).
-    """
+    """Min-heap for priority queue operations."""
     def __init__(self):
         self._heap: List[Tuple] = []
 
@@ -749,11 +665,6 @@ class MinHeap:
         priority, _, item = heapq.heappop(self._heap)
         return priority, item
 
-    def peek(self) -> Optional[Tuple[float, Any]]:
-        if self._heap:
-            return self._heap[0][0], self._heap[0][2]
-        return None
-
     def __len__(self):
         return len(self._heap)
 
@@ -761,71 +672,30 @@ class MinHeap:
         return [(p, item) for p, _, item in sorted(self._heap)]
 
 
-class Graph:
-    """
-    Adjacency list graph for subject → topic dependency mapping.
-    Can detect which subjects share topics (useful for exam planning).
-    Uses BFS/DFS for traversal.
-    """
-    def __init__(self):
-        self._adj: Dict[str, List[str]] = defaultdict(list)
-        self._nodes: set = set()
-
-    def add_edge(self, u: str, v: str):
-        self._adj[u].append(v)
-        self._nodes.update([u, v])
-
-    def bfs(self, start: str) -> List[str]:
-        visited, result = {start}, [start]
-        q = deque([start])
-        while q:
-            node = q.popleft()
-            for neighbor in self._adj[node]:
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    result.append(neighbor)
-                    q.append(neighbor)
-        return result
-
-    def connected_components(self) -> List[List[str]]:
-        visited = set()
-        components = []
-        for node in self._nodes:
-            if node not in visited:
-                component = self.bfs(node)
-                components.append(component)
-                visited.update(component)
-        return components
-
-
 class RingBuffer:
-    """
-    Fixed-size circular buffer for storing last N attendance events.
-    O(1) append, used for recent attendance streak tracking.
-    """
+    """Fixed-size circular buffer for streak tracking."""
     def __init__(self, size: int):
         self._buf: List[Optional[Any]] = [None] * size
         self._size = size
-        self._pos = 0
+        self._pos  = 0
         self._count = 0
 
     def append(self, item: Any):
         self._buf[self._pos % self._size] = item
-        self._pos += 1
+        self._pos  += 1
         self._count = min(self._count + 1, self._size)
 
     def to_list(self) -> List[Any]:
         if self._count < self._size:
-            return [x for x in self._buf[:self._count] if x is not None]
+            return [x for x in self._buf[: self._count] if x is not None]
         start = self._pos % self._size
         return self._buf[start:] + self._buf[:start]
 
     @property
-    def streak(self) -> int:
-        """Consecutive present count from most recent."""
-        items = self.to_list()
+    def current_streak(self) -> int:
+        """Consecutive PRESENT count from most recent."""
         count = 0
-        for item in reversed(items):
+        for item in reversed(self.to_list()):
             if item == AttendanceStatus.PRESENT:
                 count += 1
             else:
@@ -834,14 +704,11 @@ class RingBuffer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CACHE MANAGER — disk + memory caching
+# CACHE MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CacheManager:
-    """
-    Two-level cache: LRU in memory + JSON on disk.
-    Cache key = SHA256 of URL + date (so cache invalidates daily).
-    """
+    """Two-level cache: LRU memory + JSON disk.  Invalidates daily."""
     def __init__(self, cache_dir: Path, ttl_hours: int = 6):
         self._dir = cache_dir
         self._ttl = timedelta(hours=ttl_hours)
@@ -852,22 +719,17 @@ class CacheManager:
         day = datetime.now().strftime("%Y-%m-%d")
         return hashlib.sha256(f"{url}:{day}".encode()).hexdigest()[:16]
 
-    def _path(self, key: str) -> Path:
-        return self._dir / f"{key}.json"
-
     def get(self, url: str) -> Optional[str]:
         key = self._key(url)
-        # Level 1: memory
         cached = self._mem.get(key)
         if cached:
             return cached
-        # Level 2: disk
-        p = self._path(key)
+        p = self._dir / f"{key}.json"
         if p.exists():
             try:
                 data = json.loads(p.read_text())
-                stored_at = datetime.fromisoformat(data["stored_at"])
-                if datetime.now() - stored_at < self._ttl:
+                stored = datetime.fromisoformat(data["stored_at"])
+                if datetime.now() - stored < self._ttl:
                     self._mem.put(key, data["html"])
                     return data["html"]
             except Exception:
@@ -877,7 +739,7 @@ class CacheManager:
     def set(self, url: str, html: str):
         key = self._key(url)
         self._mem.put(key, html)
-        p = self._path(key)
+        p = self._dir / f"{key}.json"
         try:
             p.write_text(json.dumps({"html": html, "stored_at": datetime.now().isoformat()}))
         except Exception:
@@ -890,140 +752,114 @@ class CacheManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLAYWRIGHT ENGINE — the real deal
+# PLAYWRIGHT ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PlaywrightEngine:
     """
-    Playwright-based browser engine.
-    - Real Chromium browser → bypasses JS rendering
-    - Intercepts all network requests → catches hidden JSON APIs
-    - Handles Cloudflare (real browser = not flagged)
-    - Auto-detects encoding issues (Malayalam etc.)
-    - Retry logic on navigation failures
+    Real Chromium browser via Playwright.
+    • Intercepts JSON API responses automatically
+    • Anti-bot-detection init script
+    • Retry with exponential backoff
+    • Caches pages (disk + memory) to avoid re-fetching on re-runs
     """
 
     def __init__(self, log: EtLabLogger, headless: bool = True, slow_mo: int = 0):
-        self.log = log
+        self.log      = log
         self.headless = headless
-        self.slow_mo = slow_mo
-        self._playwright = None
-        self._browser: Optional[Browser] = None
+        self.slow_mo  = slow_mo
+        self._pw      = None
+        self._browser: Optional[Browser]        = None
         self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
-        self._intercepted_api: Dict[str, Any] = {}
-        self._cache = CacheManager(CACHE_DIR)
+        self._page:    Optional[Page]           = None
+        self._intercepted: Dict[str, Any]       = {}
+        self._cache   = CacheManager(CACHE_DIR)
 
     def start(self):
-        """Launch browser."""
         if not PLAYWRIGHT_OK:
-            raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install chromium")
+            raise RuntimeError("Playwright not installed.")
         self.log.info("Launching browser engine 🚀")
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
+        self._pw      = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
             headless=self.headless,
             slow_mo=self.slow_mo,
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
                 "--disable-dev-shm-usage",
-                "--disable-extensions",
             ],
         )
         self._context = self._browser.new_context(
             viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
             locale="en-IN",
             timezone_id="Asia/Kolkata",
             java_script_enabled=True,
-            accept_downloads=False,
             ignore_https_errors=True,
         )
-        # Anti-detection: hide navigator.webdriver
-        self._context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        """)
+        self._context.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+        )
         self._page = self._context.new_page()
         self._setup_intercept()
         self.log.success("Browser ready")
 
     def _setup_intercept(self):
-        """Intercept network responses to catch JSON APIs."""
-        def on_response(response: PWResponse):
+        def on_response(resp: PWResponse):
             try:
-                ct = response.headers.get("content-type", "")
-                url = response.url
+                ct  = resp.headers.get("content-type", "")
+                url = resp.url
                 if "json" in ct or any(re.search(p, url) for p in API_INTERCEPT_PATTERNS):
                     try:
-                        body = response.json()
-                        self._intercepted_api[url] = body
-                        self.log.debug(f"Intercepted API: {url[:80]}")
+                        self._intercepted[url] = resp.json()
+                        self.log.debug(f"API intercepted: {url[:80]}")
                     except Exception:
                         pass
             except Exception:
                 pass
-
         self._page.on("response", on_response)
 
     def stop(self):
-        """Close browser cleanly."""
-        try:
-            if self._context:
-                self._context.close()
-            if self._browser:
-                self._browser.close()
-            if self._playwright:
-                self._playwright.stop()
-        except Exception:
-            pass
+        for obj in [self._context, self._browser, self._pw]:
+            try:
+                if obj:
+                    obj.close() if hasattr(obj, "close") else obj.stop()
+            except Exception:
+                pass
 
-    def navigate(self, url: str, wait: str = "networkidle", timeout: int = 30000,
-                 retries: int = 3) -> Optional[str]:
-        """
-        Navigate to URL and return rendered HTML.
-        Falls back through multiple wait strategies.
-        Retries on timeout.
-        """
-        # Check cache first
+    def navigate(self, url: str, wait: str = "networkidle",
+                 timeout: int = 30000, retries: int = 3) -> Optional[str]:
         cached = self._cache.get(url)
         if cached:
             self.log.debug(f"Cache hit: {url[:60]}")
             return cached
 
-        wait_strategies = [wait, "domcontentloaded", "load", "commit"]
-
+        strategies = [wait, "domcontentloaded", "load"]
         for attempt in range(retries):
-            for strategy in wait_strategies:
+            for strategy in strategies:
                 try:
                     self._page.goto(url, wait_until=strategy, timeout=timeout)
-                    # Extra wait for dynamic content
-                    try:
-                        self._page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
+                    self._page.wait_for_timeout(1200)
                     html = self._page.content()
                     if html and len(html) > 500:
                         self._cache.set(url, html)
                         return html
                 except Exception as e:
-                    if "timeout" not in str(e).lower() and attempt == retries - 1:
-                        self.log.warn(f"Navigation error ({strategy}): {e}")
+                    if attempt == retries - 1:
+                        self.log.warn(f"Nav error ({strategy}): {e}")
                     continue
-
-            # Exponential backoff between retries
             if attempt < retries - 1:
-                wait_time = (2 ** attempt) + 1
-                self.log.warn(f"Retry {attempt + 1}/{retries} in {wait_time}s...")
-                time.sleep(wait_time)
+                wait_sec = 2 ** attempt + 1
+                self.log.warn(f"Retry {attempt+1}/{retries} in {wait_sec}s…")
+                time.sleep(wait_sec)
 
-        self.log.error(f"Failed to navigate to {url[:60]} after {retries} retries")
+        self.log.error(f"Failed to navigate: {url[:70]}")
         return None
-
-    def get_cookies(self) -> List[dict]:
-        return self._context.cookies() if self._context else []
 
     def get_current_url(self) -> str:
         try:
@@ -1031,24 +867,7 @@ class PlaywrightEngine:
         except Exception:
             return ""
 
-    def fill_and_submit(self, selector: str, value: str):
-        """Fill a form field safely."""
-        try:
-            self._page.wait_for_selector(selector, timeout=5000)
-            self._page.fill(selector, value)
-        except Exception as e:
-            self.log.warn(f"Could not fill {selector}: {e}")
-
-    def click(self, selector: str, timeout: int = 5000):
-        """Click an element safely."""
-        try:
-            self._page.wait_for_selector(selector, timeout=timeout)
-            self._page.click(selector)
-        except Exception as e:
-            self.log.warn(f"Could not click {selector}: {e}")
-
     def screenshot(self, path: Path):
-        """Save a screenshot for debugging."""
         try:
             self._page.screenshot(path=str(path), full_page=True)
         except Exception:
@@ -1056,7 +875,7 @@ class PlaywrightEngine:
 
     @property
     def intercepted_api_data(self) -> Dict[str, Any]:
-        return copy.deepcopy(self._intercepted_api)
+        return copy.deepcopy(self._intercepted)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1064,152 +883,151 @@ class PlaywrightEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabAuth:
-    """
-    Multi-strategy login handler.
-    Strategy 1: Standard form submit (CSS selectors)
-    Strategy 2: Try multiple input name patterns
-    Strategy 3: JavaScript injection login
-    Strategy 4: Direct POST simulation
-    """
+    """Multi-strategy login: CSS selectors → JS injection → Enter key."""
 
-    LOGIN_FIELD_PATTERNS = [
+    LOGIN_PATTERNS = [
         ('input[name="LoginForm[username]"]', 'input[name="LoginForm[password]"]'),
+        ('#LoginForm_username',               '#LoginForm_password'),
         ('input[name="username"]',            'input[name="password"]'),
         ('input[type="text"]',                'input[type="password"]'),
-        ('#LoginForm_username',               '#LoginForm_password'),
-        ('input[id*="username"]',             'input[id*="password"]'),
     ]
-
     SUBMIT_PATTERNS = [
         'input[type="submit"]',
         'button[type="submit"]',
         'button:has-text("Login")',
-        'button:has-text("Sign In")',
         '.btn-primary',
     ]
 
     def __init__(self, engine: PlaywrightEngine, log: EtLabLogger):
-        self.engine = engine
-        self.log = log
+        self.engine    = engine
+        self.log       = log
         self.logged_in = False
 
     def login(self, username: str, password: str, max_attempts: int = 3) -> bool:
-        """Attempt login with multiple strategies."""
         login_url = urljoin(BASE_URL, "/user/login")
-
         for attempt in range(1, max_attempts + 1):
-            self.log.info(f"Login attempt {attempt}/{max_attempts}...")
+            self.log.info(f"Login attempt {attempt}/{max_attempts}…")
             html = self.engine.navigate(login_url, wait="domcontentloaded")
-
             if not html:
                 self.log.error("Could not load login page")
                 continue
 
-            # Save debug screenshot
             self.engine.screenshot(OUTPUT_DIR / "debug_login.png")
+            page = self.engine._page
 
-            # Try each field pattern
-            success = False
-            for user_sel, pass_sel in self.LOGIN_FIELD_PATTERNS:
+            filled = False
+            for user_sel, pass_sel in self.LOGIN_PATTERNS:
                 try:
-                    page = self.engine._page
-                    user_el = page.query_selector(user_sel)
-                    pass_el = page.query_selector(pass_sel)
-                    if user_el and pass_el:
-                        user_el.fill("")
-                        user_el.type(username, delay=50)
-                        pass_el.fill("")
-                        pass_el.type(password, delay=50)
-                        self.log.debug(f"Filled fields: {user_sel}, {pass_sel}")
+                    u_el = page.query_selector(user_sel)
+                    p_el = page.query_selector(pass_sel)
+                    if not (u_el and p_el):
+                        continue
+                    u_el.fill("")
+                    u_el.type(username, delay=40)
+                    p_el.fill("")
+                    p_el.type(password, delay=40)
+                    self.log.debug(f"Filled: {user_sel}")
 
-                        # Try each submit button
-                        for submit_sel in self.SUBMIT_PATTERNS:
-                            btn = page.query_selector(submit_sel)
-                            if btn:
-                                btn.click()
-                                break
-                        else:
-                            # Fallback: press Enter
-                            pass_el.press("Enter")
+                    clicked = False
+                    for sub_sel in self.SUBMIT_PATTERNS:
+                        btn = page.query_selector(sub_sel)
+                        if btn:
+                            btn.click()
+                            clicked = True
+                            break
+                    if not clicked:
+                        p_el.press("Enter")
 
-                        # Wait for navigation
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=10000)
-                        except Exception:
-                            page.wait_for_timeout(3000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        page.wait_for_timeout(3000)
 
-                        current_url = self.engine.get_current_url()
-                        if "login" not in current_url.lower():
-                            self.log.success(f"Login successful! → {current_url}")
-                            self.logged_in = True
-                            return True
+                    cur = self.engine.get_current_url()
+                    if "login" not in cur.lower():
+                        self.log.success(f"Login OK → {cur}")
+                        self.logged_in = True
+                        return True
 
-                        # Check for error message on page
-                        page_text = page.inner_text("body") if page else ""
-                        if any(kw in page_text.lower() for kw in ["invalid", "incorrect", "wrong", "error"]):
-                            self.log.error("Wrong credentials. Check username/password.")
-                            return False
+                    body_text = page.inner_text("body") or ""
+                    if any(kw in body_text.lower() for kw in ["invalid", "incorrect", "wrong"]):
+                        self.log.error("Wrong credentials.")
+                        return False
 
-                        success = True
-                        break
+                    filled = True
+                    break
                 except Exception as e:
-                    self.log.debug(f"Field pattern {user_sel} failed: {e}")
+                    self.log.debug(f"Pattern {user_sel} failed: {e}")
                     continue
 
-            if not success:
-                # Strategy: JavaScript injection
-                self.log.warn("Trying JS injection login...")
+            if not filled:
+                # JS injection fallback
+                self.log.warn("Trying JS injection login…")
                 try:
-                    self.engine._page.evaluate(f"""
-                        () => {{
-                            let inputs = document.querySelectorAll('input[type="text"], input[type="email"]');
-                            let passes = document.querySelectorAll('input[type="password"]');
-                            if (inputs.length > 0) inputs[0].value = '{username}';
-                            if (passes.length > 0) passes[0].value = '{password}';
-                            let form = document.querySelector('form');
-                            if (form) form.submit();
-                        }}
-                    """)
-                    self.engine._page.wait_for_timeout(3000)
-                    current_url = self.engine.get_current_url()
-                    if "login" not in current_url.lower():
+                    page.evaluate(f"""() => {{
+                        let u = document.querySelector('input[type="text"],input[type="email"]');
+                        let p = document.querySelector('input[type="password"]');
+                        if (u) u.value = '{username}';
+                        if (p) p.value = '{password}';
+                        let f = document.querySelector('form');
+                        if (f) f.submit();
+                    }}""")
+                    page.wait_for_timeout(3000)
+                    if "login" not in self.engine.get_current_url().lower():
                         self.log.success("JS login worked!")
                         self.logged_in = True
                         return True
                 except Exception as e:
                     self.log.warn(f"JS injection failed: {e}")
 
-            # Backoff between attempts
             if attempt < max_attempts:
                 time.sleep(3 * attempt)
 
-        self.log.error("All login strategies failed.")
+        self.log.error("All login strategies exhausted.")
         return False
-
-    def verify_session(self) -> bool:
-        """Check if still logged in."""
-        url = self.engine.get_current_url()
-        return bool(url) and "login" not in url.lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML PARSER — handles multiple EtLab HTML versions
+# HTML PARSER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabParser:
     """
-    Robust multi-strategy HTML parser.
-    Each parse method tries multiple approaches and picks the best result.
+    Handles all EtLab HTML parsing.
+
+    Key fixes vs v3:
+    ─────────────────
+    parse_subject_summary():
+        The attendance-subject page is a PIVOT TABLE:
+          columns = [UNi Reg No, Roll No, Name, <code1>, <code2>, …, Total, Percentage]
+          one data row per student
+        Each subject-code cell contains "51/62 (82%)" → present/total(pct%).
+        Non-subject columns are skipped via ATTENDANCE_TABLE_SKIP_COLS.
+
+    parse_results():
+        The results page has multiple widget-box sections each with its own
+        <table>:  Sessional · Module Test · Assignments · Tutorials · Seminars
+        Columns are: Subject | Semester | Exam | Maximum Marks | Marks Obtained
+        Maximum Marks comes BEFORE Marks Obtained — they were reversed in v3.
+        Empty / colspan rows ("No class projects yet") are silently skipped.
+
+    discover_batch_id():
+        Prefers long encoded IDs (>= 10 digits) from href patterns like
+        /viewattendancesubject/32481378255 over short 3-4 digit IDs that
+        could collide with the student DB ID.
     """
 
     def __init__(self, log: EtLabLogger):
-        self.log = log
+        self.log           = log
         self._subject_trie = Trie()
+        # code → full name mapping built from results page
+        self._code_to_name: Dict[str, str] = {}
+
+    # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
     def _soup(html: str) -> BeautifulSoup:
-        """Parse HTML with best available parser."""
-        for parser in ["lxml", "html.parser", "html5lib"]:
+        for parser in ["lxml", "html.parser"]:
             try:
                 return BeautifulSoup(html, parser)
             except Exception:
@@ -1218,295 +1036,386 @@ class EtLabParser:
 
     @staticmethod
     def _clean(text: str) -> str:
-        """Normalize whitespace and encoding artifacts."""
         if not text:
             return ""
         text = re.sub(r'\s+', ' ', text).strip()
-        text = text.replace('\xa0', ' ').replace('\u00a0', ' ')
+        text = text.replace('\xa0', ' ').replace('\u200b', '')
         return text
 
     @staticmethod
     def _extract_numbers(text: str) -> List[int]:
-        """Extract all integers from text."""
         return [int(m) for m in re.findall(r'\b(\d+)\b', text)]
 
     @staticmethod
     def _detect_cell_status(cell: Tag) -> AttendanceStatus:
-        """
-        Multi-strategy cell status detection:
-        1. CSS classes
-        2. Background color (style attr)
-        3. Text content
-        4. Title/tooltip attribute
-        """
+        """Detect presence/absence from CSS classes, style, title, text."""
         if not cell:
             return AttendanceStatus.UNKNOWN
-
         classes = cell.get("class") or []
-        status = AttendanceStatus.from_classes(classes)
+        status  = AttendanceStatus.from_classes(classes)
         if status != AttendanceStatus.UNKNOWN:
             return status
-
-        # Check style for background color hints
         style = cell.get("style", "").lower()
-        if "green" in style or "#0f0" in style or "success" in style:
-            return AttendanceStatus.PRESENT
-        if "red" in style or "danger" in style or "#f00" in style:
-            return AttendanceStatus.ABSENT
-
-        # Check title/tooltip
+        if "green" in style:  return AttendanceStatus.PRESENT
+        if "red"   in style:  return AttendanceStatus.ABSENT
         title = (cell.get("title") or cell.get("data-original-title") or "").lower()
-        if "present" in title:     return AttendanceStatus.PRESENT
-        if "absent" in title:      return AttendanceStatus.ABSENT
-        if "duty" in title:        return AttendanceStatus.DUTY_LEAVE
-        if "medical" in title:     return AttendanceStatus.MEDICAL
-
-        # Check text
-        text = cell.get_text(strip=True).lower()
-        if text in ("p", "present"):  return AttendanceStatus.PRESENT
-        if text in ("a", "absent"):   return AttendanceStatus.ABSENT
-        if text in ("dl", "duty"):    return AttendanceStatus.DUTY_LEAVE
-        if text in ("ml", "medical"): return AttendanceStatus.MEDICAL
-
+        if "present" in title: return AttendanceStatus.PRESENT
+        if "absent"  in title: return AttendanceStatus.ABSENT
+        if "duty"    in title: return AttendanceStatus.DUTY_LEAVE
+        if "medical" in title: return AttendanceStatus.MEDICAL
+        text = cell.get_text(strip=True).upper()
+        if text in ("P", "PRESENT"):  return AttendanceStatus.PRESENT
+        if text in ("A", "ABSENT"):   return AttendanceStatus.ABSENT
+        if text in ("DL", "DUTY"):    return AttendanceStatus.DUTY_LEAVE
+        if text in ("ML", "MEDICAL"): return AttendanceStatus.MEDICAL
         return AttendanceStatus.UNKNOWN
 
-    def parse_subject_from_cell(self, cell: Tag) -> Tuple[str, str, str]:
-        """
-        Extract (code, name, topic) from a table cell.
-        Handles multiple formats:
-        - "25DSBST201 - MATHEMATICS..."
-        - Just subject name
-        - Code in one element, name in another
-        """
+    def _parse_subject_cell(self, cell: Tag) -> Tuple[str, str, str]:
+        """Return (code, name, topic) from an attendance-date cell."""
         if not cell:
             return "", "", ""
-
         anchor = cell.find("a")
-        el = anchor if anchor else cell
-
-        # Get main text (not in spans)
-        main_text = ""
+        el     = anchor if anchor else cell
+        main   = ""
         for content in el.children:
             if isinstance(content, NavigableString) and content.strip():
-                main_text = self._clean(str(content))
+                main = self._clean(str(content))
                 break
-
-        if not main_text:
-            main_text = self._clean(el.get_text())
-
-        # Get topic from span (tooltip)
-        span = el.find("span")
+        if not main:
+            main = self._clean(el.get_text())
+        span  = el.find("span")
         topic = self._clean(span.get_text()) if span else ""
+        m = re.match(r"^([A-Z0-9]{6,})\s*[-–:]\s*(.+)$", main, re.IGNORECASE)
+        if m:
+            return m.group(1).strip(), m.group(2).strip(), topic
+        return "", main, topic
 
-        # Parse code - name
-        patterns = [
-            r"^([A-Z0-9]{6,})\s*[-–:]\s*(.+)$",
-            r"^(\w+\d+\w*)\s+(.+)$",
-        ]
-        for pattern in patterns:
-            m = re.match(pattern, main_text, re.IGNORECASE)
-            if m:
-                return m.group(1).strip(), m.group(2).strip(), topic
-
-        return "", main_text, topic
+    # ── attendance date page ──────────────────────────────────────────────
 
     def parse_attendance_page(self, html: str) -> Tuple[List[AttendanceRecord], str, str]:
         """
-        Parse attendance page with 3 strategies:
-        1. Standard EtLab table format
-        2. Alternate CSS class format
-        3. Generic table format
-        Returns (records, month_pct, overall_pct)
+        Parse the date-wise attendance table.
+        Each row is a date (<th>), each TD is a class period.
+        Returns (records, month_pct, overall_pct).
         """
-        soup = self._soup(html)
-        records = []
-        month_pct = ""
+        soup        = self._soup(html)
+        records     = []
+        month_pct   = ""
         overall_pct = ""
 
-        # Try to find percentage summaries first
         for el in soup.find_all(string=re.compile(r'\d+\.?\d*\s*%')):
             text = str(el)
             if "month" in text.lower():
-                m = re.search(r'(\d+\.?\d*)\s*%', text)
+                m = re.search(r'(\d+\.?\d*)%', text)
                 if m:
                     month_pct = m.group(1) + "%"
             if any(w in text.lower() for w in ["overall", "till", "total"]):
-                m = re.search(r'(\d+\.?\d*)\s*%', text)
+                m = re.search(r'(\d+\.?\d*)%', text)
                 if m:
                     overall_pct = m.group(1) + "%"
 
-        # Strategy 1: Standard EtLab table
-        main_table = soup.find("table")
-        if main_table:
-            records = self._parse_standard_table(main_table)
+        for table in soup.find_all("table"):
+            r = self._parse_date_table(table)
+            records.extend(r)
 
-        # Strategy 2: Multiple tables (subject-per-table layout)
-        if not records:
-            all_tables = soup.find_all("table")
-            for table in all_tables:
-                r = self._parse_standard_table(table)
-                records.extend(r)
-
-        # Strategy 3: Div-based layout
         if not records:
             records = self._parse_div_layout(soup)
 
-        self.log.debug(f"Parsed {len(records)} attendance records")
+        self.log.debug(f"Parsed {len(records)} date-view attendance records")
         return records, month_pct, overall_pct
 
-    def _parse_standard_table(self, table: Tag) -> List[AttendanceRecord]:
-        """Parse standard EtLab date-row attendance table."""
+    def _parse_date_table(self, table: Tag) -> List[AttendanceRecord]:
         records = []
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            return records
-
-        for row in rows:
-            # Date cell is usually in <th>
+        for row in table.find_all("tr"):
             date_cell = row.find("th")
             if not date_cell:
                 continue
-
             date_text = self._clean(date_cell.get_text())
             if not date_text or not re.search(r'\d', date_text):
                 continue
-
-            # Skip holiday / weekend rows
-            row_classes = row.get("class") or []
-            if any(c in " ".join(row_classes).lower() for c in ["holiday", "sunday", "weekend"]):
+            row_cls = " ".join(row.get("class") or []).lower()
+            if any(k in row_cls for k in ["holiday", "sunday", "weekend"]):
                 continue
-            if "sun" in " ".join(row_classes).lower():
-                continue
-
-            cells = row.find_all("td")
-            for period_idx, cell in enumerate(cells, start=1):
+            for idx, cell in enumerate(row.find_all("td"), start=1):
                 status = self._detect_cell_status(cell)
                 if status in (AttendanceStatus.UNKNOWN, AttendanceStatus.HOLIDAY):
                     continue
-
-                code, name, topic = self.parse_subject_from_cell(cell)
+                code, name, topic = self._parse_subject_cell(cell)
                 if not name and not code:
                     continue
-
                 records.append(AttendanceRecord(
-                    date=date_text,
-                    day_of_week="",
-                    subject_code=code,
-                    subject_name=name,
-                    status=status,
-                    period=period_idx,
-                    topic=topic,
+                    date=date_text, day_of_week="",
+                    subject_code=code, subject_name=name,
+                    status=status, period=idx, topic=topic,
                     raw_class=" ".join(cell.get("class") or []),
                 ))
-
         return records
 
     def _parse_div_layout(self, soup: BeautifulSoup) -> List[AttendanceRecord]:
-        """Fallback: parse div-based attendance cards."""
         records = []
-        # Look for attendance card-style divs
-        cards = soup.find_all("div", class_=re.compile(r"attend|card|item", re.I))
-        for card in cards:
-            status_classes = card.get("class") or []
-            status = AttendanceStatus.from_classes(status_classes)
+        for card in soup.find_all("div", class_=re.compile(r"attend|card|item", re.I)):
+            status = AttendanceStatus.from_classes(card.get("class") or [])
             if status == AttendanceStatus.UNKNOWN:
                 continue
-
             date_el = card.find(class_=re.compile(r"date|day", re.I))
-            date_text = self._clean(date_el.get_text()) if date_el else ""
-
-            subject_el = card.find(class_=re.compile(r"subject|course|name", re.I))
-            name = self._clean(subject_el.get_text()) if subject_el else ""
-
+            subj_el = card.find(class_=re.compile(r"subject|course|name", re.I))
+            name    = self._clean(subj_el.get_text()) if subj_el else ""
             if name:
                 records.append(AttendanceRecord(
-                    date=date_text, day_of_week="",
-                    subject_code="", subject_name=name,
+                    date=self._clean(date_el.get_text()) if date_el else "",
+                    day_of_week="", subject_code="", subject_name=name,
                     status=status, period=0,
                 ))
         return records
 
+    # ── attendance subject summary page (PIVOT TABLE) ─────────────────────
+
     def parse_subject_summary(self, html: str) -> Dict[str, SubjectAttendance]:
-        """Parse subject-wise attendance summary page."""
-        soup = self._soup(html)
+        """
+        The EtLab subject-attendance page is a PIVOT / wide-format table:
+
+          | UNi Reg No | Roll No | Name | 25DSBST201 | 25DSBSP202 | … | Total | Percentage |
+          | UKP25CD030 |   30    | KAIL | 51/62 (82%)|65/75 (87%) | … | 381/… |    83%     |
+
+        Steps:
+          1. Find the <table class="items table-striped …">
+          2. Read header row → locate subject-code columns (skip meta cols)
+          3. Parse the single student data row
+          4. For each subject col: extract present/total from "51/62 (82%)"
+          5. Also capture Roll No and Reg No into a side-dict for profile enrichment
+        """
+        soup     = self._soup(html)
         subjects: Dict[str, SubjectAttendance] = {}
 
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
+        # Grab the main data table — prefer class="items"
+        table = soup.find("table", class_=re.compile(r"\bitems\b"))
+        if not table:
+            table = soup.find("table")
+        if not table:
+            self.log.warn("No table found in attendance-subject page")
+            return subjects
+
+        thead = table.find("thead")
+        tbody = table.find("tbody")
+        if not thead or not tbody:
+            self.log.warn("Attendance subject table missing thead/tbody")
+            return subjects
+
+        raw_headers = [self._clean(th.get_text()) for th in thead.find_all("th")]
+        self.log.debug(f"Pivot headers ({len(raw_headers)}): {raw_headers}")
+
+        # Identify subject-code columns — anything that looks like a KTU code
+        # and is NOT in the skip-set
+        subject_cols: List[Tuple[int, str]] = []  # (col_index, code)
+        for i, h in enumerate(raw_headers):
+            if h.lower() in ATTENDANCE_TABLE_SKIP_COLS:
+                continue
+            # KTU subject codes: 8-11 uppercase alphanum chars
+            if re.match(r'^[A-Z0-9]{6,12}$', h.strip()):
+                subject_cols.append((i, h.strip()))
+
+        self.log.debug(f"Subject columns found: {[c for _, c in subject_cols]}")
+
+        if not subject_cols:
+            self.log.warn("No subject-code columns detected in pivot table")
+            return subjects
+
+        # Find Roll No and Reg No column indices for profile enrichment
+        roll_col = next((i for i, h in enumerate(raw_headers)
+                         if "roll" in h.lower()), -1)
+        reg_col  = next((i for i, h in enumerate(raw_headers)
+                         if "reg" in h.lower() or "uni" in h.lower()), -1)
+
+        data_rows = tbody.find_all("tr")
+        if not data_rows:
+            self.log.warn("No data rows in attendance pivot table")
+            return subjects
+
+        # Use the first data row (this is a single-student view)
+        row   = data_rows[0]
+        cells = row.find_all("td")
+        texts = [self._clean(c.get_text()) for c in cells]
+
+        self.log.debug(f"Pivot data row cells ({len(texts)}): {texts[:5]}…")
+
+        # Side-capture: store roll/reg for profile enrichment
+        if roll_col >= 0 and roll_col < len(texts):
+            self._last_roll = texts[roll_col]
+        if reg_col >= 0 and reg_col < len(texts):
+            self._last_reg = texts[reg_col]
+
+        for col_idx, code in subject_cols:
+            if col_idx >= len(texts):
+                self.log.warn(f"Column index {col_idx} out of range for code {code}")
                 continue
 
-            # Detect column layout from header
-            header_row = rows[0]
-            headers = [self._clean(c.get_text()).lower() for c in header_row.find_all(["th", "td"])]
+            cell_text = texts[col_idx].strip()  # e.g. "51/62 (82%)"
 
-            # Find column indices
-            col_map = {}
-            for i, h in enumerate(headers):
-                if "subject" in h and "code" in h:        col_map["code"] = i
-                elif "subject" in h and "name" in h:      col_map["name"] = i
-                elif "subject" in h:                       col_map.setdefault("name", i)
-                elif "total" in h or "conducted" in h:    col_map["total"] = i
-                elif "present" in h:                       col_map["present"] = i
-                elif "absent" in h:                        col_map["absent"] = i
-                elif "duty" in h:                          col_map["duty"] = i
-                elif "medical" in h:                       col_map["medical"] = i
-                elif "%" in h or "percent" in h:           col_map["pct"] = i
+            # Parse "present/total (pct%)"
+            m = re.match(r'(\d+)\s*/\s*(\d+)\s*\((\d+(?:\.\d+)?)%\)', cell_text)
+            if not m:
+                # Try bare "present/total" without percentage
+                m2 = re.match(r'(\d+)\s*/\s*(\d+)', cell_text)
+                if not m2:
+                    self.log.debug(f"Cannot parse cell '{cell_text}' for {code}")
+                    continue
+                present_count = int(m2.group(1))
+                total_count   = int(m2.group(2))
+            else:
+                present_count = int(m.group(1))
+                total_count   = int(m.group(2))
 
-            if not col_map:
+            absent_count = total_count - present_count
+
+            # Resolve full subject name if already known from results
+            full_name = self._code_to_name.get(code, code)
+
+            sa = SubjectAttendance(
+                code=code,
+                name=full_name,
+                total_classes=total_count,
+                present=present_count,
+                absent=absent_count,
+            )
+            subjects[full_name] = sa
+            self._subject_trie.insert(full_name)
+            self._subject_trie.insert(code)   # also index by code
+
+        self.log.success(
+            f"Pivot parser: {len(subjects)} subjects "
+            f"({sum(s.total_classes for s in subjects.values())} total classes)"
+        )
+        return subjects
+
+    # ── results page (multiple widget-box sections) ───────────────────────
+
+    def parse_results(self, html: str) -> List[SeriesExam]:
+        """
+        The EtLab results page has multiple <div class="widget-box"> sections:
+          • Sessional exams    → <h5>Sessional exams</h5>
+          • Module Test        → <h5>Module Test</h5>
+          • Class Projects     → often empty
+          • Assignments        → may say "NOT SUBMITTED"
+          • Tutorials          → often empty
+          • Seminars           → often empty
+
+        Each section has a <table class="items table"> with columns:
+          Subject | Semester | Exam | Maximum Marks | Marks Obtained | View Response
+
+        Columns are parsed by HEADER NAME not position, so future reordering
+        won't break anything.
+
+        Empty colspan rows ("No class projects yet") are skipped automatically.
+        """
+        soup    = self._soup(html)
+        results: List[SeriesExam] = []
+
+        for widget in soup.find_all("div", class_="widget-box"):
+            title_el = widget.find("h5")
+            category = self._clean(title_el.get_text()) if title_el else "Unknown"
+
+            table = widget.find("table", class_=re.compile(r"\bitems\b"))
+            if not table:
                 continue
 
-            for row in rows[1:]:
-                cells = row.find_all(["td", "th"])
+            thead = table.find("thead")
+            tbody = table.find("tbody")
+            if not thead or not tbody:
+                continue
+
+            raw_headers = [self._clean(th.get_text()).lower()
+                           for th in thead.find_all("th")]
+
+            # Build column index map by header keyword
+            def _col(keyword: str) -> int:
+                for i, h in enumerate(raw_headers):
+                    if keyword in h:
+                        return i
+                return -1
+
+            col_subject  = _col("subject")
+            col_semester = _col("semester")
+            col_exam     = max(_col("exam"), _col("assignment"), _col("title"), _col("name"))
+            col_max      = _col("maximum")
+            col_obtained = _col("obtained")
+
+            # col_exam: pick the first non-(-1) among those
+            for kw in ["exam", "assignment", "title", "class project", "name"]:
+                idx = _col(kw)
+                if idx >= 0:
+                    col_exam = idx
+                    break
+
+            for row in tbody.find_all("tr"):
+                cells = row.find_all("td")
+
+                # Skip empty / colspan placeholder rows
+                if len(cells) == 1:
+                    continue
                 if not cells:
                     continue
+
                 texts = [self._clean(c.get_text()) for c in cells]
-                if not any(texts):
+
+                # Skip if all cells empty
+                if not any(t for t in texts):
                     continue
 
-                # Extract subject name/code
-                name_col = col_map.get("name", 0)
-                code_col = col_map.get("code", -1)
-
-                subject_text = texts[name_col] if name_col < len(texts) else ""
+                # Parse subject column: "CODE - FULL NAME"
+                subject_text = texts[col_subject] if 0 <= col_subject < len(texts) else ""
                 if not subject_text:
                     continue
 
-                # Try to parse code from subject text
-                code = texts[code_col] if code_col >= 0 and code_col < len(texts) else ""
-                if not code:
-                    m = re.match(r"^([A-Z0-9]{4,})\s*[-–:]\s*(.+)$", subject_text)
-                    if m:
-                        code, subject_text = m.group(1), m.group(2)
+                code = ""
+                name = subject_text
+                sm   = re.match(r'^([A-Z0-9]{6,})\s*[-–]\s*(.+)$', subject_text)
+                if sm:
+                    code = sm.group(1).strip()
+                    name = sm.group(2).strip()
+                    # Register in global code→name map for attendance enrichment
+                    self._code_to_name[code] = name
 
-                sa = SubjectAttendance(code=code, name=subject_text)
+                semester   = texts[col_semester] if 0 <= col_semester < len(texts) else ""
+                exam_label = texts[col_exam]     if 0 <= col_exam     < len(texts) else ""
+                max_marks  = texts[col_max]      if 0 <= col_max      < len(texts) else ""
+                obtained   = texts[col_obtained] if 0 <= col_obtained < len(texts) else ""
 
-                # Fill numeric fields
-                def safe_int(col_key: str) -> int:
-                    idx = col_map.get(col_key, -1)
-                    if idx < 0 or idx >= len(texts):
-                        return 0
-                    nums = self._extract_numbers(texts[idx])
-                    return nums[0] if nums else 0
+                # Skip rows where subject is a placeholder message
+                if re.match(r'^no\b', name.lower()):
+                    continue
 
-                sa.total_classes = safe_int("total")
-                sa.present       = safe_int("present")
-                sa.absent        = safe_int("absent")
-                sa.duty_leave    = safe_int("duty")
-                sa.medical_leave = safe_int("medical")
+                results.append(SeriesExam(
+                    category=category,
+                    subject_code=code,
+                    subject_name=name,
+                    semester=semester,
+                    exam_label=exam_label,
+                    max_marks=max_marks,
+                    marks_obtained=obtained,
+                ))
 
-                if sa.total_classes > 0 or sa.present > 0:
-                    subjects[subject_text] = sa
-                    self._subject_trie.insert(subject_text)
+        self.log.success(f"Results parser: {len(results)} entries across all sections")
+        return results
 
-        return subjects
+    # ── profile ───────────────────────────────────────────────────────────
 
     def parse_profile(self, html: str) -> StudentProfile:
-        """Multi-strategy profile parser."""
-        soup = self._soup(html)
+        """Multi-strategy profile parser: table → dl → headings → title."""
+        soup    = self._soup(html)
         profile = StudentProfile()
 
-        # Strategy 1: Table key-value pairs
+        field_map = {
+            "name": "name", "student name": "name",
+            "roll":   "roll_number", "rollno": "roll_number",
+            "register": "roll_number",
+            "department": "department", "branch": "department", "dept": "department",
+            "semester": "semester", "sem": "semester",
+            "batch":   "batch",
+            "email":   "email",
+            "phone":   "phone", "mobile": "phone",
+            "college": "college", "institution": "college",
+        }
+
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
@@ -1514,188 +1423,131 @@ class EtLabParser:
                     continue
                 key = self._clean(cells[0].get_text()).lower()
                 val = self._clean(cells[1].get_text())
-
-                field_map = {
-                    "name": "name", "student name": "name",
-                    "roll": "roll_number", "register": "roll_number",
-                    "department": "department", "branch": "department", "dept": "department",
-                    "semester": "semester", "sem": "semester",
-                    "batch": "batch",
-                    "email": "email",
-                    "phone": "phone", "mobile": "phone",
-                    "college": "college", "institution": "college",
-                }
                 for k, attr in field_map.items():
                     if k in key and not getattr(profile, attr):
                         setattr(profile, attr, val)
 
-        # Strategy 2: Definition list (dl/dt/dd)
         if not profile.name:
             for dl in soup.find_all("dl"):
-                dts = dl.find_all("dt")
-                dds = dl.find_all("dd")
-                for dt, dd in zip(dts, dds):
-                    key = self._clean(dt.get_text()).lower()
-                    val = self._clean(dd.get_text())
-                    if "name" in key:
-                        profile.name = val
-
-        # Strategy 3: Extract from page title or h-tags
-        if not profile.name:
-            for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
-                text = self._clean(tag.get_text())
-                if text and 3 < len(text) < 60:
-                    skip_words = ["dashboard", "profile", "etlab", "menu", "home", "login", "logout"]
-                    if not any(w in text.lower() for w in skip_words):
-                        profile.name = text
+                for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
+                    if "name" in self._clean(dt.get_text()).lower():
+                        profile.name = self._clean(dd.get_text())
                         break
 
-        # Strategy 4: Meta tags
         if not profile.name:
-            meta_title = soup.find("title")
-            if meta_title:
-                title = meta_title.get_text()
-                parts = re.split(r'[-|–—]', title)
-                if parts:
-                    name_candidate = self._clean(parts[0])
-                    if name_candidate and not any(w in name_candidate.lower() for w in ["etlab", "login"]):
-                        profile.name = name_candidate
+            # Try navbar username display
+            for el in soup.find_all("span", class_="text"):
+                t = self._clean(el.get_text())
+                if t and 3 < len(t) < 60:
+                    skip = {"dashboard", "profile", "etlab", "home", "login",
+                            "logout", "messages", "inbox"}
+                    if not any(w in t.lower() for w in skip):
+                        profile.name = t
+                        break
+
+        # Pull name from page title as last resort
+        if not profile.name:
+            title_el = soup.find("title")
+            if title_el:
+                parts = re.split(r'[-|–—]', title_el.get_text())
+                cand  = self._clean(parts[0]) if parts else ""
+                if cand and "etlab" not in cand.lower():
+                    profile.name = cand
+
+        # College from header
+        if not profile.college:
+            header = soup.find(id="header") or soup.find(class_="dash-date")
+            if header:
+                t = self._clean(header.get_text())
+                if "college" in t.lower() or "university" in t.lower():
+                    profile.college = t
 
         return profile
 
-    def parse_results(self, html: str) -> List[ExamResult]:
-        """Parse exam results page."""
-        soup = self._soup(html)
-        results = []
-
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            headers = [self._clean(c.get_text()).lower() for c in rows[0].find_all(["th", "td"])]
-            if not any(kw in " ".join(headers) for kw in ["subject", "grade", "marks", "result"]):
-                continue
-
-            for row in rows[1:]:
-                cells = row.find_all(["td", "th"])
-                texts = [self._clean(c.get_text()) for c in cells]
-                if not texts or all(not t for t in texts):
-                    continue
-
-                result = ExamResult(
-                    exam_name="", subject_code="", subject_name="",
-                    marks_obtained="", max_marks="", grade="", credits="", result=""
-                )
-                for i, header in enumerate(headers):
-                    if i >= len(texts):
-                        break
-                    v = texts[i]
-                    if "code" in header:          result.subject_code = v
-                    elif "name" in header:        result.subject_name = v
-                    elif "subject" in header and not result.subject_name:
-                        m = re.match(r"^([A-Z0-9]+)\s*[-:]\s*(.+)$", v)
-                        if m:
-                            result.subject_code, result.subject_name = m.group(1), m.group(2)
-                        else:
-                            result.subject_name = v
-                    elif "grade" in header:       result.grade = v
-                    elif "credit" in header:      result.credits = v
-                    elif "mark" in header or "score" in header:
-                        if not result.marks_obtained: result.marks_obtained = v
-                        else: result.max_marks = v
-                    elif "result" in header or "status" in header:
-                        result.result = v
-
-                if result.subject_name or result.subject_code:
-                    results.append(result)
-
-        return results
+    # ── timetable ─────────────────────────────────────────────────────────
 
     def parse_timetable(self, html: str) -> List[TimetableSlot]:
-        """Parse timetable page."""
-        soup = self._soup(html)
-        slots = []
-        DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        soup  = self._soup(html)
+        slots: List[TimetableSlot] = []
+        DAYS  = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
             if len(rows) < 2:
                 continue
-            header_cells = rows[0].find_all(["th", "td"])
-            period_headers = [self._clean(c.get_text()) for c in header_cells]
+            period_hdrs = [self._clean(c.get_text()) for c in rows[0].find_all(["th", "td"])]
 
-            for row_idx, row in enumerate(rows[1:]):
+            for r_idx, row in enumerate(rows[1:]):
                 cells = row.find_all(["td", "th"])
                 if not cells:
                     continue
                 day_text = self._clean(cells[0].get_text())
-                day = next((d for d in DAYS if d.lower() in day_text.lower()),
-                           DAYS[row_idx] if row_idx < len(DAYS) else f"Day {row_idx+1}")
-
-                for col_idx, cell in enumerate(cells[1:], start=1):
+                day      = next(
+                    (d for d in DAYS if d.lower() in day_text.lower()),
+                    DAYS[r_idx] if r_idx < len(DAYS) else f"Day {r_idx+1}",
+                )
+                for c_idx, cell in enumerate(cells[1:], start=1):
                     text = self._clean(cell.get_text())
-                    if not text or text in ("-", "—", ""):
+                    if not text or text in ("-", "—"):
                         continue
-                    m = re.match(r"^([A-Z0-9]+)\s*[-:]\s*(.+)$", text)
+                    m    = re.match(r"^([A-Z0-9]+)\s*[-:]\s*(.+)$", text)
                     code = m.group(1) if m else ""
                     name = m.group(2) if m else text
-                    th = period_headers[col_idx] if col_idx < len(period_headers) else ""
-                    tm = re.search(r"(\d+:\d+)\s*[-–]\s*(\d+:\d+)", th)
+                    hdr  = period_hdrs[c_idx] if c_idx < len(period_hdrs) else ""
+                    tm   = re.search(r"(\d+:\d+)\s*[-–]\s*(\d+:\d+)", hdr)
                     slots.append(TimetableSlot(
-                        day=day, period=col_idx,
+                        day=day, period=c_idx,
                         subject_code=code, subject_name=name,
                         start_time=tm.group(1) if tm else "",
-                        end_time=tm.group(2) if tm else "",
+                        end_time=tm.group(2)   if tm else "",
                     ))
-
         return slots
+
+    # ── batch ID discovery ────────────────────────────────────────────────
 
     def discover_batch_id(self, html: str) -> Tuple[str, str, str]:
         """
-        Extract batch_id, encoded batch_id, and student_db_id from HTML.
-        Tries multiple regex patterns for different EtLab versions.
-        Returns (batch_id, batch_id_enc, student_db_id)
+        Returns (batch_id, batch_id_encoded, student_db_id).
+
+        Priority: long encoded IDs (>= 10 digits) from known URL patterns
+        are preferred to avoid collisions with the 4-digit student DB ID.
         """
-        soup = self._soup(html)
+        soup    = self._soup(html)
         batch_id = batch_id_enc = student_db_id = ""
 
-        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        all_hrefs += [form.get("action", "") for form in soup.find_all("form")]
+        all_hrefs  = [a.get("href", "") for a in soup.find_all("a", href=True)]
+        all_hrefs += [f.get("action", "") for f in soup.find_all("form", action=True)]
+        all_text   = " ".join(s.get_text() for s in soup.find_all("script"))
 
-        # Also check JS variables in script tags
-        all_scripts = " ".join(s.get_text() for s in soup.find_all("script"))
-
-        patterns = [
-            (r'/(\d{3,})', 'batch_id'),
-            (r'batch_id[=:/](\w+)', 'batch_id_enc'),
-            (r'/medicalleave/(\d+)', 'student_db_id'),
-            (r'/student/(\d+)', 'student_db_id'),
-            (r'student_id[=:/](\d+)', 'student_db_id'),
-        ]
-
-        sources = all_hrefs + [all_scripts]
-
-        for source in sources:
+        # Pattern priority: long encoded IDs first
+        for source in all_hrefs:
             if not source:
                 continue
-            for pattern, field in patterns:
-                m = re.search(pattern, source)
-                if m:
-                    val = m.group(1)
-                    if field == 'batch_id' and not batch_id and len(val) >= 3:
-                        batch_id = val
-                    elif field == 'batch_id_enc' and not batch_id_enc:
-                        batch_id_enc = val
-                    elif field == 'student_db_id' and not student_db_id:
-                        student_db_id = val
+            # Long encoded batch ID (>= 10 digits) from known URL patterns
+            m = re.search(r'viewattendancesubject/(\d{8,})', source)
+            if m and not batch_id_enc:
+                batch_id_enc = m.group(1)
+            m = re.search(r'viewsubjectattendancemonth/(\d{8,})', source)
+            if m and not batch_id_enc:
+                batch_id_enc = m.group(1)
+            # Short numeric batch ID from form action
+            m = re.search(r'viewattendancesubject/(\d{3,7})', source)
+            if m and not batch_id:
+                batch_id = m.group(1)
+            # student_db_id from medical leave / student profile URL
+            m = re.search(r'/medicalleave/(\d+)', source)
+            if m and not student_db_id:
+                student_db_id = m.group(1)
+            m = re.search(r'student_id=(\d+)', source)
+            if m and not student_db_id:
+                student_db_id = m.group(1)
 
-        # Also check JS
-        for pattern, field in [
-            (r'batchId["\s:=]+["\']?(\d+)', 'batch_id'),
-            (r'batch_id["\s:=]+["\']?(\w+)', 'batch_id'),
-            (r'studentId["\s:=]+["\']?(\d+)', 'student_db_id'),
+        # JS variables
+        for pat, field in [
+            (r'batchId\s*[=:]\s*["\']?(\d+)', 'batch_id'),
+            (r'studentId\s*[=:]\s*["\']?(\d+)', 'student_db_id'),
         ]:
-            m = re.search(pattern, all_scripts)
+            m = re.search(pat, all_text)
             if m:
                 val = m.group(1)
                 if field == 'batch_id' and not batch_id:
@@ -1703,36 +1555,32 @@ class EtLabParser:
                 elif field == 'student_db_id' and not student_db_id:
                     student_db_id = val
 
-        return batch_id, batch_id_enc, student_db_id
+        # Use encoded as primary if available (it's the real one EtLab uses)
+        return batch_id_enc or batch_id, batch_id_enc, student_db_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN SCRAPER ORCHESTRATOR
+# SCRAPER ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabScraper:
     """
-    Main scraper that orchestrates everything:
-    1. Launch Playwright
-    2. Login
-    3. Discover IDs
-    4. Scrape all pages
-    5. Check for intercepted APIs (best case)
-    6. Parse HTML as fallback
-    7. Consolidate into AcademicData
+    Orchestrates the full scrape lifecycle:
+      login → dashboard → profile → attendance → results → timetable → consolidate
     """
 
     def __init__(self, username: str, password: str, headless: bool = True,
-                 no_cache: bool = False, log: EtLabLogger = None):
-        self.username = username
-        self.password = password
-        self.log = log or EtLabLogger()
-        self.engine = PlaywrightEngine(self.log, headless=headless)
-        self.auth = EtLabAuth(self.engine, self.log)
-        self.parser = EtLabParser(self.log)
-        self.data = AcademicData()
+                 no_cache: bool = False, semester: int = 0, log: EtLabLogger = None):
+        self.username  = username
+        self.password  = password
+        self.semester  = semester
+        self.log       = log or EtLabLogger()
+        self.engine    = PlaywrightEngine(self.log, headless=headless)
+        self.auth      = EtLabAuth(self.engine, self.log)
+        self.parser    = EtLabParser(self.log)
+        self.data      = AcademicData()
         self.data.profile.student_id = username
-        self._batch_id = ""
+        self._batch_id     = ""
         self._batch_id_enc = ""
         self._student_db_id = ""
         if no_cache:
@@ -1741,220 +1589,196 @@ class EtLabScraper:
     def _url(self, path: str) -> str:
         return urljoin(BASE_URL, path)
 
-    def _try_endpoints(self, endpoint_key: str, **fmt_kwargs) -> Optional[str]:
-        """Try multiple endpoint patterns, return first successful HTML."""
-        patterns = ENDPOINT_PATTERNS.get(endpoint_key, [])
-        for pattern in patterns:
+    def _try_endpoints(self, key: str, **fmt) -> Optional[str]:
+        for pattern in ENDPOINT_PATTERNS.get(key, []):
             try:
-                path = pattern.format(**{
-                    "batch_id": self._batch_id,
-                    "batch_id_enc": self._batch_id_enc,
-                    "student_id": self._student_db_id,
-                    **fmt_kwargs,
-                })
+                path = pattern.format(
+                    batch_id=self._batch_id,
+                    batch_id_enc=self._batch_id_enc,
+                    student_id=self._student_db_id,
+                    **fmt,
+                )
             except KeyError:
                 continue
-
-            url = self._url(path)
-            spinner = _spinner(f"Fetching {endpoint_key}")
-            html = self.engine.navigate(url)
+            url     = self._url(path)
+            spinner = _spinner(f"Fetching {key}")
+            html    = self.engine.navigate(url)
             spinner.set()
-
             if html and len(html) > 1000:
-                # Check we didn't get redirected to login
-                current = self.engine.get_current_url()
-                if "login" in current.lower():
-                    self.log.warn(f"Session expired while fetching {endpoint_key}")
+                cur = self.engine.get_current_url()
+                if "login" in cur.lower():
+                    self.log.warn("Session expired mid-fetch")
                     return None
-
-                self.data.scraped_pages[endpoint_key] = ScrapedPage(
-                    url=url, html=html, method="playwright"
-                )
-                # Save debug HTML
-                (OUTPUT_DIR / f"debug_{endpoint_key}.html").write_text(
+                self.data.scraped_pages[key] = ScrapedPage(url=url, html=html)
+                (OUTPUT_DIR / f"debug_{key}.html").write_text(
                     html, encoding="utf-8", errors="replace"
                 )
-                self.log.success(f"Got {endpoint_key} ({len(html):,} bytes)")
+                self.log.success(f"Got {key} ({len(html):,} bytes)")
                 return html
-
-        self.log.warn(f"All endpoints failed for: {endpoint_key}")
+        self.log.warn(f"All endpoints failed: {key}")
         return None
 
     def _update_ids(self, html: str):
-        """Update batch/student IDs from any page HTML."""
         bid, benc, sid = self.parser.discover_batch_id(html)
         if bid and not self._batch_id:
             self._batch_id = bid
-            self.log.info(f"Found batch_id: {bid}")
+            self.log.info(f"batch_id → {bid}")
         if benc and not self._batch_id_enc:
             self._batch_id_enc = benc
+            self.log.info(f"batch_id_enc → {benc}")
         if sid and not self._student_db_id:
             self._student_db_id = sid
-            self.log.info(f"Found student_db_id: {sid}")
-
-        self.data.profile.batch_id = self._batch_id
+            self.log.info(f"student_db_id → {sid}")
+        self.data.profile.batch_id      = self._batch_id
         self.data.profile.student_db_id = self._student_db_id
 
     def _check_api_intercepts(self) -> bool:
-        """
-        Check if Playwright intercepted any JSON attendance APIs.
-        If yes, parse those directly — much cleaner than HTML.
-        """
         api_data = self.engine.intercepted_api_data
         if not api_data:
             return False
-
         self.data.api_data = api_data
-        found_attendance = False
-
+        found = False
         for url, payload in api_data.items():
             self.log.info(f"Checking intercepted API: {url[:60]}")
-
-            # Try to parse attendance from API response
-            if isinstance(payload, list):
-                records = self._parse_api_attendance_list(payload)
+            items = payload if isinstance(payload, list) else None
+            if isinstance(payload, dict):
+                for key in ["attendance", "data", "records", "list"]:
+                    if key in payload and isinstance(payload[key], list):
+                        items = payload[key]
+                        break
+            if items:
+                records = self._parse_api_attendance(items)
                 if records:
                     self.data.attendance_records.extend(records)
-                    found_attendance = True
+                    found = True
+        if found:
+            self.log.success(
+                f"API intercept: {len(self.data.attendance_records)} records"
+            )
+        return found
 
-            elif isinstance(payload, dict):
-                # Check common keys
-                for key in ["attendance", "data", "records", "list", "result"]:
-                    if key in payload and isinstance(payload[key], list):
-                        records = self._parse_api_attendance_list(payload[key])
-                        if records:
-                            self.data.attendance_records.extend(records)
-                            found_attendance = True
-
-        if found_attendance:
-            self.log.success(f"Parsed {len(self.data.attendance_records)} records from API intercept!")
-        return found_attendance
-
-    def _parse_api_attendance_list(self, items: List[dict]) -> List[AttendanceRecord]:
-        """Parse attendance from a JSON list (API response)."""
+    def _parse_api_attendance(self, items: List[dict]) -> List[AttendanceRecord]:
         records = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            # Flexible key matching
-            status_val = (
-                item.get("status") or item.get("attendance_status") or
-                item.get("present") or item.get("type") or ""
-            )
-            subject = (
-                item.get("subject_name") or item.get("subject") or
-                item.get("course_name") or item.get("name") or ""
-            )
-            date = (
-                item.get("date") or item.get("attendance_date") or
-                item.get("class_date") or ""
-            )
-
+            sv = (item.get("status") or item.get("attendance_status") or
+                  item.get("present") or item.get("type") or "")
+            subject = (item.get("subject_name") or item.get("subject") or
+                       item.get("course_name") or "")
+            date    = (item.get("date") or item.get("attendance_date") or "")
             if not subject:
                 continue
-
-            status_str = str(status_val).lower()
-            if "present" in status_str or status_val == 1 or status_val is True:
+            ss = str(sv).lower()
+            if "present" in ss or sv in (1, True):
                 status = AttendanceStatus.PRESENT
-            elif "absent" in status_str or status_val == 0 or status_val is False:
+            elif "absent"  in ss or sv in (0, False):
                 status = AttendanceStatus.ABSENT
-            elif "duty" in status_str:
+            elif "duty"    in ss:
                 status = AttendanceStatus.DUTY_LEAVE
-            elif "medical" in status_str:
+            elif "medical" in ss:
                 status = AttendanceStatus.MEDICAL
             else:
                 continue
-
             records.append(AttendanceRecord(
-                date=str(date),
-                day_of_week="",
+                date=str(date), day_of_week="",
                 subject_code=item.get("subject_code", ""),
                 subject_name=str(subject),
-                status=status,
-                period=item.get("period", 0),
+                status=status, period=item.get("period", 0),
                 topic=item.get("topic", ""),
             ))
         return records
 
     def scrape_all(self) -> AcademicData:
-        """Master scrape method."""
         OUTPUT_DIR.mkdir(exist_ok=True)
-
         try:
             self.engine.start()
         except Exception as e:
-            self.log.critical(f"Browser failed to start: {e}")
+            self.log.critical(f"Browser start failed: {e}")
             self.data.add_error(str(e))
             return self.data
 
         try:
-            # ── LOGIN ────────────────────────────────────────────────────
+            # LOGIN
             if not self.auth.login(self.username, self.password):
                 self.data.add_error("Login failed")
                 return self.data
 
-            # ── DASHBOARD ────────────────────────────────────────────────
-            self.log.info("Scraping dashboard...")
+            # RESULTS first — so code→name map is populated before attendance
+            self.log.info("Scraping results…")
+            res_html = self._try_endpoints("results")
+            if res_html:
+                self._update_ids(res_html)
+                self.data.series_results = self.parser.parse_results(res_html)
+                self.log.success(f"Results: {len(self.data.series_results)} entries")
+
+            # DASHBOARD
+            self.log.info("Scraping dashboard…")
             dash_html = self._try_endpoints("dashboard")
             if dash_html:
                 self._update_ids(dash_html)
 
-            # ── PROFILE ──────────────────────────────────────────────────
-            self.log.info("Scraping profile...")
-            profile_html = self._try_endpoints("profile")
-            if profile_html:
-                self._update_ids(profile_html)
-                self.data.profile = self.parser.parse_profile(profile_html)
-                self.data.profile.student_id = self.username
-                self.data.profile.batch_id = self._batch_id
+            # PROFILE
+            self.log.info("Scraping profile…")
+            prof_html = self._try_endpoints("profile")
+            if prof_html:
+                self._update_ids(prof_html)
+                self.data.profile = self.parser.parse_profile(prof_html)
+                self.data.profile.student_id    = self.username
+                self.data.profile.batch_id      = self._batch_id
+                self.data.profile.student_db_id = self._student_db_id
+                # Enrich from pivot table side-captures
+                if hasattr(self.parser, "_last_roll") and not self.data.profile.roll_number:
+                    self.data.profile.roll_number = self.parser._last_roll
+                if hasattr(self.parser, "_last_reg") and not self.data.profile.reg_number:
+                    self.data.profile.reg_number = self.parser._last_reg
                 self.log.success(f"Profile: {self.data.profile.display_name}")
 
-            # ── ATTENDANCE DATE VIEW ──────────────────────────────────────
-            self.log.info("Scraping attendance...")
+            # ATTENDANCE DATE VIEW
+            self.log.info("Scraping attendance (date view)…")
             att_html = self._try_endpoints("attendance_date")
             if att_html:
                 self._update_ids(att_html)
-                records, month_pct, overall_pct = self.parser.parse_attendance_page(att_html)
-                self.data.attendance_records.extend(records)
-                self.log.info(f"Date view: {len(records)} records | Month: {month_pct} | Overall: {overall_pct}")
+                recs, mpct, opct = self.parser.parse_attendance_page(att_html)
+                self.data.attendance_records.extend(recs)
+                self.log.info(f"Date view: {len(recs)} records | Month: {mpct} | Overall: {opct}")
 
-            # ── ATTENDANCE SUBJECT VIEW ───────────────────────────────────
+            # ATTENDANCE SUBJECT VIEW (pivot table)
             if self._batch_id:
+                self.log.info("Scraping attendance (subject pivot)…")
                 subj_html = self._try_endpoints("attendance_subject")
                 if subj_html:
-                    subject_data = self.parser.parse_subject_summary(subj_html)
-                    self.data.subject_attendance.update(subject_data)
-                    self.log.success(f"Subject summary: {len(subject_data)} subjects")
+                    subj_data = self.parser.parse_subject_summary(subj_html)
+                    self.data.subject_attendance.update(subj_data)
+                    # Also capture roll/reg from pivot
+                    if hasattr(self.parser, "_last_roll") and not self.data.profile.roll_number:
+                        self.data.profile.roll_number = self.parser._last_roll
+                    if hasattr(self.parser, "_last_reg") and not self.data.profile.reg_number:
+                        self.data.profile.reg_number = self.parser._last_reg
 
                 month_html = self._try_endpoints("attendance_month")
                 if month_html:
-                    month_records, _, _ = self.parser.parse_attendance_page(month_html)
-                    self.data.attendance_records.extend(month_records)
+                    mrecs, _, _ = self.parser.parse_attendance_page(month_html)
+                    self.data.attendance_records.extend(mrecs)
 
-            # ── CHECK INTERCEPTED APIs ────────────────────────────────────
+            # API intercepts
             self._check_api_intercepts()
 
-            # ── RESULTS ──────────────────────────────────────────────────
-            self.log.info("Scraping results...")
-            res_html = self._try_endpoints("results")
-            if res_html:
-                self.data.results = self.parser.parse_results(res_html)
-                self.log.success(f"Results: {len(self.data.results)} entries")
-
-            # ── TIMETABLE ────────────────────────────────────────────────
-            self.log.info("Scraping timetable...")
+            # TIMETABLE
+            self.log.info("Scraping timetable…")
             tt_html = self._try_endpoints("timetable")
             if tt_html:
                 self.data.timetable = self.parser.parse_timetable(tt_html)
                 self.log.success(f"Timetable: {len(self.data.timetable)} slots")
 
-            # ── CONSOLIDATE ──────────────────────────────────────────────
+            # CONSOLIDATE
             self._consolidate_attendance()
+            self._enrich_subject_names()
 
         except KeyboardInterrupt:
-            self.log.warn("Interrupted by user.")
+            self.log.warn("Interrupted.")
         except Exception as e:
-            self.log.error(f"Unexpected error: {e}")
+            self.log.error(f"Unexpected: {e}")
             self.log.debug(traceback.format_exc())
             self.data.add_error(str(e))
         finally:
@@ -1964,10 +1788,15 @@ class EtLabScraper:
 
     def _consolidate_attendance(self):
         """
-        Build SubjectAttendance from raw records using a priority queue + hashmap.
-        Deduplicates by (subject, date) — best-status wins.
-        Time: O(n log n), Space: O(n)
+        Merge raw AttendanceRecord list into SubjectAttendance objects.
+        Deduplicates (subject, date) — best-status wins (present > duty > medical > absent).
+        Only runs if the pivot-table parse produced nothing (fallback path).
         """
+        # If pivot table already gave us subject_attendance, don't double-count
+        if self.data.subject_attendance:
+            self.log.info("Subject attendance already populated from pivot table — skipping consolidation")
+            return
+
         STATUS_PRIORITY = {
             AttendanceStatus.PRESENT:    4,
             AttendanceStatus.DUTY_LEAVE: 3,
@@ -1976,50 +1805,32 @@ class EtLabScraper:
             AttendanceStatus.UNKNOWN:    0,
         }
 
-        # subject → date → best_status
-        subject_day: Dict[str, Dict[str, AttendanceStatus]] = defaultdict(dict)
-        subject_codes: Dict[str, str] = {}
-        subject_topics: Dict[str, List[str]] = defaultdict(list)
-        # Track per-subject streaks using ring buffers
-        subject_rings: Dict[str, RingBuffer] = {}
+        subject_day:    Dict[str, Dict[str, AttendanceStatus]] = defaultdict(dict)
+        subject_codes:  Dict[str, str]                         = {}
+        subject_topics: Dict[str, List[str]]                   = defaultdict(list)
 
         for rec in self.data.attendance_records:
             key = rec.subject_name or rec.subject_code
             if not key:
                 continue
-
             subject_codes[key] = rec.subject_code
-
             curr = subject_day[key].get(rec.date)
-            curr_p = STATUS_PRIORITY.get(curr, 0)
-            new_p  = STATUS_PRIORITY.get(rec.status, 0)
-            if new_p > curr_p:
+            if STATUS_PRIORITY.get(rec.status, 0) > STATUS_PRIORITY.get(curr, 0):
                 subject_day[key][rec.date] = rec.status
-
             if rec.topic and rec.topic not in subject_topics[key]:
                 subject_topics[key].append(rec.topic)
 
-        # Build/merge SubjectAttendance objects
         for subject_name, day_map in subject_day.items():
-            if subject_name not in self.data.subject_attendance:
-                self.data.subject_attendance[subject_name] = SubjectAttendance(
-                    code=subject_codes.get(subject_name, ""),
-                    name=subject_name,
-                )
-
-            sa = self.data.subject_attendance[subject_name]
-            sa.code = subject_codes.get(subject_name, sa.code)
-            sa.topics = subject_topics[subject_name]
-
+            sa = SubjectAttendance(
+                code=subject_codes.get(subject_name, ""),
+                name=subject_name,
+                topics=subject_topics[subject_name],
+            )
             ring = RingBuffer(30)
-
-            # Sort dates chronologically
-            sorted_dates = sorted(day_map.keys(), key=lambda d: re.sub(r'\D', '', d))
-            for date_str in sorted_dates:
+            for date_str in sorted(day_map.keys(), key=lambda d: re.sub(r'\D', '', d)):
                 status = day_map[date_str]
                 sa.total_classes += 1
                 ring.append(status)
-
                 if status == AttendanceStatus.PRESENT:
                     sa.present += 1
                     sa.dates_present.append(date_str)
@@ -2030,14 +1841,41 @@ class EtLabScraper:
                     sa.duty_leave += 1
                 elif status == AttendanceStatus.MEDICAL:
                     sa.medical_leave += 1
+            self.data.subject_attendance[subject_name] = sa
 
-            subject_rings[subject_name] = ring
-
+        total = sum(s.total_classes for s in self.data.subject_attendance.values())
         if self.data.subject_attendance:
-            total = sum(sa.total_classes for sa in self.data.subject_attendance.values())
-            self.log.success(f"Consolidated: {len(self.data.subject_attendance)} subjects, {total} total classes")
+            self.log.success(
+                f"Consolidated (fallback): {len(self.data.subject_attendance)} subjects, "
+                f"{total} classes"
+            )
         else:
-            self.log.warn("No attendance data could be parsed. Saved debug HTML files in etlab_output/ — please inspect them.")
+            self.log.warn("No attendance data parsed. Check debug_attendance_*.html files.")
+
+    def _enrich_subject_names(self):
+        """
+        After parse_results() has built _code_to_name, replace code-keyed
+        SubjectAttendance entries with full-name keys.
+        """
+        code_to_name = self.parser._code_to_name
+        if not code_to_name:
+            return
+
+        new_map: Dict[str, SubjectAttendance] = {}
+        for key, sa in self.data.subject_attendance.items():
+            if sa.name in code_to_name.values():
+                new_map[sa.name] = sa
+            elif sa.code in code_to_name:
+                sa.name = code_to_name[sa.code]
+                new_map[sa.name] = sa
+            elif key in code_to_name:
+                sa.name = code_to_name[key]
+                new_map[sa.name] = sa
+            else:
+                new_map[key] = sa
+
+        self.data.subject_attendance = new_map
+        self.log.debug(f"Name enrichment complete: {list(new_map.keys())}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2046,24 +1884,28 @@ class EtLabScraper:
 
 class EtLabAnalytics:
     """
-    Advanced analytics engine.
-    Uses priority queues, statistical analysis, what-if simulation.
+    Analytics on top of AcademicData:
+    • summary()         — overall stats dict
+    • what_if()         — attendance prediction simulator
+    • bunk_planner()    — greedy strategy for remaining classes
+    • series_summary()  — per-subject exam marks breakdown
+    • risk_ranking()    — subjects sorted by urgency
     """
 
     def __init__(self, data: AcademicData):
-        self.data = data
-        self._risk_heap = MinHeap()
+        self.data          = data
+        self._risk_heap    = MinHeap()
         self._subject_trie = Trie()
         self._df_subjects: Optional[Any] = None
-        self._df_records: Optional[Any] = None
+        self._df_records:  Optional[Any] = None
         self._build_structures()
 
     def _build_structures(self):
-        """Build all data structures from AcademicData."""
         for name, sa in self.data.subject_attendance.items():
             self._subject_trie.insert(name)
+            if sa.code:
+                self._subject_trie.insert(sa.code)
             self._risk_heap.push(sa.percentage, sa)
-
         if PANDAS_OK:
             self._df_subjects = self._build_subjects_df()
             self._df_records  = self._build_records_df()
@@ -2074,171 +1916,143 @@ class EtLabAnalytics:
         rows = []
         for name, sa in self.data.subject_attendance.items():
             rows.append({
-                "code": sa.code,
-                "name": name,
+                "code": sa.code, "name": name,
                 "short": self._short(name),
                 "total": sa.total_classes,
-                "present": sa.present,
-                "absent": sa.absent,
-                "duty": sa.duty_leave,
-                "medical": sa.medical_leave,
-                "pct": sa.percentage,
-                "raw_pct": sa.raw_percentage,
-                "safe": sa.is_safe,
-                "danger": sa.is_danger,
+                "present": sa.present, "absent": sa.absent,
+                "duty": sa.duty_leave, "medical": sa.medical_leave,
+                "pct": sa.percentage, "raw_pct": sa.raw_percentage,
+                "safe": sa.is_safe, "danger": sa.is_danger,
                 "can_bunk": sa.classes_can_bunk,
                 "need_attend": sa.classes_to_attend,
                 "shortage": sa.shortage,
                 "vibe": sa.vibe_check,
             })
-        df = pd.DataFrame(rows)
-        return df.sort_values("pct")
+        return pd.DataFrame(rows).sort_values("pct")
 
     def _build_records_df(self):
         if not self.data.attendance_records:
             return pd.DataFrame()
-        rows = [r.to_dict() for r in self.data.attendance_records]
-        return pd.DataFrame(rows)
+        return pd.DataFrame([r.to_dict() for r in self.data.attendance_records])
 
     @staticmethod
-    def _short(name: str, n: int = 28) -> str:
+    def _short(name: str, n: int = 24) -> str:
         words = name.split()
         s = " ".join(words[:3])
         return (s[:n] + "…") if len(s) > n else s
 
     def summary(self) -> Dict[str, Any]:
-        """Compute overall summary stats."""
         subjects = list(self.data.subject_attendance.values())
         if not subjects:
             return {}
 
-        total_present  = sum(s.present for s in subjects)
-        total_classes  = sum(s.total_classes for s in subjects)
-        total_absent   = sum(s.absent for s in subjects)
-        overall_pct    = round(total_present / total_classes * 100, 2) if total_classes else 0
-        safe_subjects  = [s for s in subjects if s.is_safe]
-        risky_subjects = [s for s in subjects if not s.is_safe]
+        total_present = sum(s.effective_present for s in subjects)
+        total_classes = sum(s.total_classes for s in subjects)
+        total_absent  = sum(s.absent for s in subjects)
+        overall_pct   = round(total_present / total_classes * 100, 2) if total_classes else 0.0
 
-        # Best/worst by heap
+        safe_subs  = [s for s in subjects if s.is_safe]
+        risky_subs = [s for s in subjects if not s.is_safe]
+
         risk_sorted = self._risk_heap.to_sorted_list()
-        worst = risk_sorted[0][1] if risk_sorted else None
+        worst = risk_sorted[0][1]  if risk_sorted else None
         best  = risk_sorted[-1][1] if risk_sorted else None
 
-        # GPA estimate from results
-        cgpa = self._compute_cgpa()
-
         return {
-            "total_subjects":       len(subjects),
-            "total_classes":        total_classes,
-            "total_present":        total_present,
-            "total_absent":         total_absent,
-            "overall_pct":          overall_pct,
-            "safe_count":           len(safe_subjects),
-            "risky_count":          len(risky_subjects),
-            "danger_count":         sum(1 for s in subjects if s.is_danger),
-            "total_can_bunk":       sum(s.classes_can_bunk for s in safe_subjects),
-            "total_need_attend":    sum(s.classes_to_attend for s in risky_subjects),
-            "worst_subject":        worst.name if worst else "N/A",
-            "worst_pct":            worst.percentage if worst else 0,
-            "best_subject":         best.name if best else "N/A",
-            "best_pct":             best.percentage if best else 0,
-            "cgpa_estimate":        cgpa,
-            "overall_vibe":         self._overall_vibe(overall_pct),
+            "total_subjects":    len(subjects),
+            "total_classes":     total_classes,
+            "total_present":     total_present,
+            "total_absent":      total_absent,
+            "overall_pct":       overall_pct,
+            "safe_count":        len(safe_subs),
+            "risky_count":       len(risky_subs),
+            "danger_count":      sum(1 for s in subjects if s.is_danger),
+            "total_can_bunk":    sum(s.classes_can_bunk for s in safe_subs),
+            "total_need_attend": sum(s.classes_to_attend for s in risky_subs),
+            "worst_subject":     worst.name if worst else "N/A",
+            "worst_pct":         worst.percentage if worst else 0,
+            "best_subject":      best.name if best else "N/A",
+            "best_pct":          best.percentage if best else 0,
+            "overall_vibe":      self._overall_vibe(overall_pct),
         }
-
-    def _compute_cgpa(self) -> float:
-        """Estimate CGPA from results."""
-        if not self.data.results:
-            return 0.0
-        total_gp = total_cr = 0
-        for r in self.data.results:
-            gp = r.grade_points
-            try:
-                cr = float(r.credits) if r.credits else 0
-            except ValueError:
-                cr = 0
-            total_gp += gp * cr
-            total_cr += cr
-        return round(total_gp / total_cr, 2) if total_cr > 0 else 0.0
 
     @staticmethod
     def _overall_vibe(pct: float) -> str:
-        if pct >= 90:   return "you absolute nerd, never missed a class 🏆"
-        if pct >= 80:   return "solid attendance, no stress bestie ✨"
-        if pct >= 75:   return "technically safe but don't push it 😬"
-        if pct >= 65:   return "bruh you're on thin ice fr ⚠️"
-        if pct >= 50:   return "BSOD (bro seriously on destruction) 💀"
-        return              "detention% speedrun world record 🚨"
+        if pct >= 90: return "absolute nerd mode 🏆"
+        if pct >= 80: return "solid attendance, no stress ✨"
+        if pct >= 75: return "technically safe, don't push it 😬"
+        if pct >= 65: return "thin ice fr fr ⚠️"
+        if pct >= 50: return "BSOD (bro seriously on destruction) 💀"
+        return             "detention% speedrun world record 🚨"
 
-    def what_if(self, subject_name: str, attend_n: int, total_n: int) -> Dict[str, Any]:
-        """
-        What-if simulator:
-        If I attend `attend_n` out of the next `total_n` classes,
-        what will my attendance be?
-        """
-        # Fuzzy find subject
-        matches = self._subject_trie.fuzzy_find(subject_name)
+    def what_if(self, subject_query: str, attend_n: int, total_n: int) -> Dict[str, Any]:
+        """Predict attendance after attending attend_n / total_n future classes."""
+        matches = self._subject_trie.fuzzy_find(subject_query)
         if not matches:
             return {"error": "Subject not found"}
-
-        _, best_match = matches[0]
-        sa = self.data.subject_attendance.get(best_match)
+        _, best = matches[0]
+        sa = self.data.subject_attendance.get(best)
         if not sa:
-            return {"error": f"No data for {best_match}"}
+            # Maybe it was keyed differently
+            for name, s in self.data.subject_attendance.items():
+                if s.code.upper() == subject_query.upper() or best in name:
+                    sa = s
+                    best = name
+                    break
+        if not sa:
+            return {"error": f"No data for: {best}"}
 
         new_pct = sa.predict_after_n_classes(total_n, attend_n)
         return {
-            "subject": best_match,
+            "subject": best,
             "current_pct": sa.percentage,
             "new_pct": new_pct,
             "change": round(new_pct - sa.percentage, 2),
             "still_safe": new_pct >= SAFE_THRESHOLD,
-            "message": f"If you attend {attend_n}/{total_n} classes, you'll be at {new_pct}% " +
-                       ("✅ safe!" if new_pct >= SAFE_THRESHOLD else "❌ still at risk"),
+            "message": (
+                f"Attending {attend_n}/{total_n} → {new_pct}% "
+                + ("✅ safe!" if new_pct >= SAFE_THRESHOLD else "❌ still at risk")
+            ),
         }
 
-    def bunk_planner(self, days_remaining: int, classes_per_day: int = 4) -> Dict[str, Any]:
-        """
-        Given remaining classes, plan optimal attendance strategy.
-        Uses a greedy algorithm: prioritize at-risk subjects.
-        """
-        total_remaining = days_remaining * classes_per_day
+    def bunk_planner(self, days_remaining: int, classes_per_day: int = 5) -> Dict[str, Any]:
+        """Greedy bunk strategy: attend at-risk subjects, skip safe ones."""
         plan = {}
-
-        # Sort by urgency (shortage first)
-        sorted_subjects = sorted(
+        for sa in sorted(
             self.data.subject_attendance.values(),
-            key=lambda s: (-s.shortage, s.percentage)
-        )
-
-        for sa in sorted_subjects:
+            key=lambda s: (-s.shortage, s.percentage),
+        ):
             if sa.is_safe:
                 plan[sa.name] = {
                     "status": "safe",
-                    "can_miss": sa.classes_can_bunk,
-                    "advice": f"can miss up to {sa.classes_can_bunk} more, enjoy life 🎉"
+                    "can_skip": sa.classes_can_bunk,
+                    "advice": f"safe — can skip up to {sa.classes_can_bunk} 🎉",
                 }
             else:
                 weeks = sa.weeks_until_safe()
                 plan[sa.name] = {
                     "status": "at_risk",
                     "need_attend": sa.classes_to_attend,
-                    "advice": f"attend next {sa.classes_to_attend} consecutively (~{weeks} weeks)",
+                    "advice": f"attend next {sa.classes_to_attend} (~{weeks} weeks)",
                     "weeks_to_safe": weeks,
                 }
-
         return {
             "days_remaining": days_remaining,
-            "total_remaining_classes": total_remaining,
+            "total_remaining_classes": days_remaining * classes_per_day,
             "plan": plan,
         }
 
-    def absence_heatmap_data(self) -> Dict[str, List[str]]:
-        """Return dates of absence per subject for heatmap."""
-        return {
-            name: sa.dates_absent
-            for name, sa in self.data.subject_attendance.items()
-        }
+    def risk_ranking(self) -> List[SubjectAttendance]:
+        """Return subjects sorted by urgency (most at-risk first)."""
+        return [item for _, item in self._risk_heap.to_sorted_list()]
+
+    def series_summary(self) -> Dict[str, List[SeriesExam]]:
+        """Group series exam results by subject name."""
+        out: Dict[str, List[SeriesExam]] = defaultdict(list)
+        for exam in self.data.series_results:
+            key = exam.subject_name or exam.subject_code
+            out[key].append(exam)
+        return dict(out)
 
     @property
     def df_subjects(self):
@@ -2254,10 +2068,10 @@ class EtLabAnalytics:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabDisplay:
-    """Gen-Z friendly terminal dashboard. No corporate vibes."""
+    """Terminal dashboard — clean, color-coded, gen-Z friendly."""
 
     def __init__(self, data: AcademicData, analytics: EtLabAnalytics):
-        self.data = data
+        self.data      = data
         self.analytics = analytics
 
     def show_all(self):
@@ -2265,17 +2079,18 @@ class EtLabDisplay:
         self.show_profile()
         self.show_attendance_table()
         self.show_summary()
-        if self.data.results:
-            self.show_results()
+        self.show_risk_advice()
+        if self.data.series_results:
+            self.show_series_results()
         if self.data.errors:
             self.show_errors()
 
     def show_banner(self):
         lines = [
-            C.bold(C.magenta("  ┌─────────────────────────────────────────┐")),
-            C.bold(C.magenta("  │       ETLAB PRO — YOUR ATTENDANCE PLUG  │")),
-            C.bold(C.magenta("  │   'know before you yolo the bunk' 🎓    │")),
-            C.bold(C.magenta("  └─────────────────────────────────────────┘")),
+            C.bold(C.magenta("  ╔══════════════════════════════════════════╗")),
+            C.bold(C.magenta("  ║    ETLAB PRO  —  YOUR ATTENDANCE BESTIE  ║")),
+            C.bold(C.magenta("  ║   'know before you yolo the bunk'  🎓    ║")),
+            C.bold(C.magenta("  ╚══════════════════════════════════════════╝")),
             C.dim(f"  Scraped at: {self.data.scraped_at[:19]}"),
         ]
         print("\n" + "\n".join(lines) + "\n")
@@ -2284,9 +2099,10 @@ class EtLabDisplay:
         p = self.data.profile
         lines = [
             f"  👤  {C.bold(p.display_name)}",
-            f"  🎓  {p.department or 'N/A'}  |  Sem {p.semester or 'N/A'}",
-            f"  🏫  {p.college or 'N/A'}",
-            f"  🔑  {p.student_id}  |  Roll: {p.roll_number or 'N/A'}",
+            f"  🏫  {p.college or 'UKF College of Engineering and Technology'}",
+            f"  🎓  {p.department or 'N/A'}  |  Semester {p.semester or 'N/A'}",
+            f"  🔑  ID: {p.student_id}  |  Roll: {p.roll_number or 'N/A'}"
+            + (f"  |  Reg: {p.reg_number}" if p.reg_number else ""),
         ]
         print(_box(lines, title="STUDENT PROFILE", color=C.BCYAN))
         print()
@@ -2294,40 +2110,38 @@ class EtLabDisplay:
     def show_attendance_table(self):
         subjects = self.data.subject_attendance
         if not subjects:
-            print(C.yellow("  ⚠️  No attendance data found. Check debug HTML files."))
+            print(C.yellow("  ⚠️  No attendance data. Check debug_attendance_subject.html"))
             return
 
-        print(C.bold(C.cyan("\n  📊 ATTENDANCE BREAKDOWN\n")))
+        print(C.bold(C.cyan("\n  📊 SUBJECT-WISE ATTENDANCE\n")))
 
-        headers = ["Subject", "Code", "Tot", "✅Pre", "❌Abs", "🟡Dty", "%", "Bar", "Status", "Bunk💤", "Need📚"]
+        headers = [
+            "Subject", "Code", "Tot", "Pre", "Abs", "Dty", "%",
+            "Progress", "Status", "Bunk💤", "Need📚",
+        ]
         rows = []
-
-        sorted_subjects = sorted(subjects.values(), key=lambda s: s.percentage)
-        for sa in sorted_subjects:
-            pct = sa.percentage
+        for sa in sorted(subjects.values(), key=lambda s: s.percentage):
+            pct     = sa.percentage
             pct_str = (C.green if sa.is_safe else C.red)(f"{pct:.1f}%")
-            bar = _progress_bar(pct, width=12, show_pct=False)
-            status = (C.green("✅ SAFE") if sa.is_safe else
-                      (C.red("💀 DEAD") if sa.is_danger else C.yellow("⚠️ RISKY")))
+            bar     = _progress_bar(pct, width=10, show_pct=False)
+            status  = (
+                C.green("✅ SAFE") if sa.is_safe else
+                (C.red("💀 DEAD") if sa.is_danger else C.yellow("⚠️  RISK"))
+            )
             bunk = C.green(str(sa.classes_can_bunk)) if sa.is_safe else C.dim("-")
-            need = C.red(str(sa.classes_to_attend)) if not sa.is_safe else C.dim("-")
-            name_short = sa.name[:28] + "…" if len(sa.name) > 28 else sa.name
+            need = C.red(str(sa.classes_to_attend))  if not sa.is_safe else C.dim("-")
+            name_s = (sa.name[:25] + "…") if len(sa.name) > 25 else sa.name
 
             rows.append([
-                name_short,
-                sa.code or "-",
+                name_s, sa.code or "-",
                 str(sa.total_classes),
-                str(sa.present),
+                str(sa.effective_present),
                 str(sa.absent),
                 str(sa.duty_leave),
-                pct_str,
-                bar,
-                status,
-                bunk,
-                need,
+                pct_str, bar, status, bunk, need,
             ])
 
-        print(_table(headers, rows))
+        print(_table(headers, rows, max_col=27))
         print()
 
     def show_summary(self):
@@ -2335,81 +2149,183 @@ class EtLabDisplay:
         if not s:
             return
 
-        pct = s["overall_pct"]
+        pct       = s["overall_pct"]
         pct_color = C.green if pct >= 75 else C.red
 
         lines = [
-            f"  🎯  Overall Attendance: {pct_color(f'{pct}%')}   {_progress_bar(pct, width=20)}",
-            f"  📚  Total Classes: {s['total_classes']}  ({C.green(str(s['total_present']) + ' present')} / {C.red(str(s['total_absent']) + ' absent')})",
-            f"  ✅  Safe Subjects: {C.green(str(s['safe_count']))}   ⚠️  At Risk: {C.yellow(str(s['risky_count']))}   💀 Danger: {C.red(str(s['danger_count']))}",
-            f"  💤  Total Bunk Budget: {C.green(str(s['total_can_bunk']))} classes across all safe subjects",
-            f"  📖  Classes to Grind: {C.red(str(s['total_need_attend']))} classes needed across at-risk subjects",
-            f"  🏆  Best: {C.green(s['best_subject'][:35])} ({s['best_pct']}%)",
-            f"  💀  Worst: {C.red(s['worst_subject'][:35])} ({s['worst_pct']}%)",
+            f"  🎯  Overall Attendance : {pct_color(f'{pct}%')}  {_progress_bar(pct, width=18)}",
+            f"  📚  Total Classes       : {s['total_classes']}  "
+            f"({C.green(str(s['total_present']) + ' present')} / "
+            f"{C.red(str(s['total_absent']) + ' absent')})",
+            f"  ✅  Safe    : {C.green(str(s['safe_count']))}  "
+            f"⚠️  At Risk : {C.yellow(str(s['risky_count']))}  "
+            f"💀 Danger  : {C.red(str(s['danger_count']))}",
+            f"  💤  Bunk Budget         : {C.green(str(s['total_can_bunk']))} classes total",
+            f"  📖  Need to Attend      : {C.red(str(s['total_need_attend']))} classes total",
+            f"  🏆  Best   : {C.green(s['best_subject'][:38])} ({s['best_pct']}%)",
+            f"  💀  Worst  : {C.red(s['worst_subject'][:38])} ({s['worst_pct']}%)",
+            f"\n  🔥  Vibe   : {C.magenta(s['overall_vibe'])}",
         ]
-        if s["cgpa_estimate"] > 0:
-            lines.append(f"  📈  Estimated CGPA: {C.cyan(str(s['cgpa_estimate']))}")
-
-        lines.append(f"\n  🔥  Vibe Check: {C.magenta(s['overall_vibe'])}")
-
         print(_box(lines, title="ACADEMIC SUMMARY", color=C.BMAGENTA))
         print()
 
-        # Per-subject vibe
-        print(C.bold(C.cyan("  💬 Subject Vibes:\n")))
-        for name, sa in sorted(self.data.subject_attendance.items(), key=lambda x: x[1].percentage):
-            emoji = sa.status_emoji
-            print(f"  {emoji}  {C.bold(name[:35])} — {C.dim(sa.vibe_check)}")
+    def show_risk_advice(self):
+        """Per-subject advice sorted by urgency."""
+        print(C.bold(C.cyan("  💬 Subject Status & Advice\n")))
+        for sa in self.analytics.risk_ranking():
+            emoji   = sa.status_emoji
+            vibe    = sa.vibe_check
+            weeks   = sa.weeks_until_safe()
+            week_s  = f"  (~{weeks} weeks to safety)" if weeks and not sa.is_safe else ""
+            print(
+                f"  {emoji}  {C.bold(sa.name[:40])}\n"
+                f"      {sa.code}  {_progress_bar(sa.percentage, width=14)}  "
+                f"{C.dim(vibe)}{C.yellow(week_s)}"
+            )
         print()
 
-    def show_results(self):
-        print(C.bold(C.cyan("\n  📝 EXAM RESULTS\n")))
-        headers = ["Subject", "Code", "Grade", "Marks", "Credits", "Result"]
-        rows = []
-        for r in self.data.results:
-            result_str = C.green("PASS") if r.is_pass else (C.red("FAIL") if r.result else "-")
-            rows.append([
-                r.subject_name[:35], r.subject_code,
-                C.yellow(r.grade), f"{r.marks_obtained}/{r.max_marks}" if r.max_marks else r.marks_obtained,
-                r.credits, result_str,
-            ])
-        print(_table(headers, rows))
-        print()
+    def show_series_results(self):
+        """
+        Show series exam results per subject with per-exam and average marks.
+        Grouped by category (Sessional, Module Test, Assignment…).
+        """
+        print(C.bold(C.cyan("\n  📝 SERIES EXAM RESULTS\n")))
+
+        by_category: Dict[str, List[SeriesExam]] = defaultdict(list)
+        for exam in self.data.series_results:
+            by_category[exam.category].append(exam)
+
+        for category, exams in by_category.items():
+            print(C.bold(C.yellow(f"  ── {category} ─────────────────────────────────")))
+            headers = ["Subject", "Code", "Exam", "Max", "Obtained", "%"]
+            rows    = []
+            for e in exams:
+                pct_s = f"{e.percentage}%" if e.percentage is not None else "-"
+                if e.percentage is not None:
+                    pct_colored = (C.green if e.percentage >= 50 else C.red)(pct_s)
+                else:
+                    pct_colored = C.dim(pct_s)
+                ob_colored = (
+                    C.dim(e.marks_obtained) if not e.is_submitted
+                    else e.marks_obtained
+                )
+                rows.append([
+                    (e.subject_name[:30] + "…") if len(e.subject_name) > 30 else e.subject_name,
+                    e.subject_code,
+                    e.exam_label,
+                    e.max_marks,
+                    ob_colored,
+                    pct_colored,
+                ])
+            print(_table(headers, rows, max_col=32))
+            print()
 
     def show_errors(self):
         if not self.data.errors:
             return
-        print(C.yellow("\n  ⚠️  Errors during scraping:"))
+        print(C.yellow("\n  ⚠️  Scraping errors:"))
         for err in self.data.errors:
             print(C.dim(f"    {err}"))
         print()
 
+    def show_ascii_calendar(self, subject_name: str):
+        """Print a simple ASCII attendance calendar for one subject."""
+        sa = self.data.subject_attendance.get(subject_name)
+        if not sa:
+            # fuzzy fallback
+            matches = Trie()
+            for n in self.data.subject_attendance:
+                matches.insert(n)
+            found = matches.fuzzy_find(subject_name)
+            if not found:
+                print(C.red("  Subject not found"))
+                return
+            subject_name = found[0][1]
+            sa = self.data.subject_attendance[subject_name]
+
+        all_dates = set(sa.dates_present + sa.dates_absent)
+        if not all_dates:
+            print(C.dim("  No date data available for calendar view"))
+            return
+
+        # Parse dates (try DD-MM-YYYY, DD/MM/YYYY, etc.)
+        parsed: Dict[datetime, str] = {}
+        for ds in all_dates:
+            for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d %b %Y"):
+                try:
+                    dt = datetime.strptime(ds.strip(), fmt)
+                    parsed[dt] = "P" if ds in sa.dates_present else "A"
+                    break
+                except ValueError:
+                    continue
+
+        if not parsed:
+            print(C.dim("  Could not parse dates for calendar"))
+            return
+
+        min_dt = min(parsed)
+        max_dt = max(parsed)
+        print(C.bold(C.cyan(f"\n  📅 Attendance Calendar: {subject_name[:50]}\n")))
+
+        cur_month = min_dt.replace(day=1)
+        while cur_month <= max_dt:
+            y, mo = cur_month.year, cur_month.month
+            print(C.bold(f"  {cal_module.month_name[mo]} {y}"))
+            print(C.dim("  Mo Tu We Th Fr Sa Su"))
+            week = cal_module.monthcalendar(y, mo)
+            for w in week:
+                row_parts = []
+                for d in w:
+                    if d == 0:
+                        row_parts.append("  ")
+                    else:
+                        dt = datetime(y, mo, d)
+                        status = parsed.get(dt)
+                        if status == "P":
+                            row_parts.append(C.green(f"{d:2d}"))
+                        elif status == "A":
+                            row_parts.append(C.red(f"{d:2d}"))
+                        else:
+                            row_parts.append(C.dim(f"{d:2d}"))
+                print("  " + " ".join(row_parts))
+            print()
+            # advance month
+            if mo == 12:
+                cur_month = cur_month.replace(year=y + 1, month=1)
+            else:
+                cur_month = cur_month.replace(month=mo + 1)
+
     def interactive_what_if(self):
-        """Interactive what-if attendance simulator."""
         subjects = list(self.data.subject_attendance.keys())
         if not subjects:
             return
-
         print(C.bold(C.cyan("\n  🔮 WHAT-IF SIMULATOR\n")))
-        print("  Which subject? (type name or partial match)")
-        for i, name in enumerate(subjects[:10]):
-            print(f"  {C.dim(str(i+1) + '.')} {name[:45]}")
-
+        print("  Subjects (type name, code, or number):")
+        for i, name in enumerate(subjects, 1):
+            sa = self.data.subject_attendance[name]
+            print(f"  {C.dim(str(i)+'.')} {name[:45]}  {C.dim(sa.code)}  "
+                  f"{_progress_bar(sa.percentage, width=8)}")
         try:
-            choice = input(C.cyan("\n  > ")).strip()
-            attend = int(input(C.cyan("  Classes you'll attend: ")).strip())
-            total  = int(input(C.cyan("  Out of how many total classes: ")).strip())
-
+            choice = input(C.cyan("\n  Subject > ")).strip()
+            # Allow numeric selection
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(subjects):
+                    choice = subjects[idx]
+            except ValueError:
+                pass
+            attend = int(input(C.cyan("  Classes you will attend > ")).strip())
+            total  = int(input(C.cyan("  Out of how many total    > ")).strip())
             result = self.analytics.what_if(choice, attend, total)
             if "error" in result:
                 print(C.red(f"  {result['error']}"))
             else:
-                change_str = (C.green(f"+{result['change']}%") if result['change'] >= 0
-                              else C.red(f"{result['change']}%"))
+                chg = result["change"]
+                chg_str = C.green(f"+{chg}%") if chg >= 0 else C.red(f"{chg}%")
                 print(_box([
-                    f"  Subject: {C.bold(result['subject'][:40])}",
-                    f"  Current: {C.cyan(str(result['current_pct']) + '%')}",
-                    f"  After:   {C.green(str(result['new_pct']) + '%')} ({change_str})",
+                    f"  Subject : {C.bold(result['subject'][:45])}",
+                    f"  Current : {C.cyan(str(result['current_pct']) + '%')}",
+                    f"  After   : {C.green(str(result['new_pct']) + '%')}  ({chg_str})",
                     f"  {result['message']}",
                 ], title="WHAT-IF RESULT", color=C.BBLUE))
         except (ValueError, KeyboardInterrupt):
@@ -2421,10 +2337,7 @@ class EtLabDisplay:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabVisualizer:
-    """
-    Matplotlib + Seaborn chart suite.
-    Dark theme, color-coded by risk level.
-    """
+    """Dark-theme Matplotlib chart suite."""
 
     PALETTE = {
         "safe":    "#00e676",
@@ -2439,31 +2352,30 @@ class EtLabVisualizer:
 
     def __init__(self, analytics: EtLabAnalytics):
         self.analytics = analytics
-        self.data = analytics.data
-        self._apply_theme()
+        self.data      = analytics.data
+        if MATPLOTLIB_OK:
+            self._apply_theme()
 
     def _apply_theme(self):
-        if not MATPLOTLIB_OK:
-            return
         p = self.PALETTE
         plt.style.use("dark_background")
         plt.rcParams.update({
-            "figure.facecolor":  p["bg"],
-            "axes.facecolor":    p["surface"],
-            "axes.edgecolor":    p["grid"],
-            "axes.labelcolor":   p["text"],
-            "xtick.color":       p["text"],
-            "ytick.color":       p["text"],
-            "text.color":        p["text"],
-            "grid.color":        p["grid"],
-            "grid.alpha":        0.5,
-            "font.family":       "monospace",
-            "figure.autolayout": False,
+            "figure.facecolor": p["bg"],
+            "axes.facecolor":   p["surface"],
+            "axes.edgecolor":   p["grid"],
+            "axes.labelcolor":  p["text"],
+            "xtick.color":      p["text"],
+            "ytick.color":      p["text"],
+            "text.color":       p["text"],
+            "grid.color":       p["grid"],
+            "grid.alpha":       0.4,
+            "font.family":      "monospace",
         })
 
-    def _bar_colors(self, values: List[float]) -> List[str]:
-        p = self.PALETTE
-        return [p["safe"] if v >= 75 else (p["danger"] if v < 60 else p["warning"]) for v in values]
+    def _bar_color(self, pct: float) -> str:
+        if pct >= 75:  return self.PALETTE["safe"]
+        if pct >= 60:  return self.PALETTE["warning"]
+        return self.PALETTE["danger"]
 
     def plot_all(self):
         if not MATPLOTLIB_OK:
@@ -2471,205 +2383,252 @@ class EtLabVisualizer:
             return
         if not self.data.subject_attendance:
             return
-
-        print(C.dim("  Generating charts..."))
+        print(C.dim("  Generating charts…"))
         try:
-            self._plot_attendance_dashboard()
+            self._plot_dashboard()
             self._plot_bunk_budget()
-            self._plot_trend() if PANDAS_OK and not self.analytics.df_records.empty else None
-            print(C.green(f"  Charts saved to {OUTPUT_DIR}/"))
+            self._plot_series_marks()
+            self._plot_trend()
+            print(C.green(f"  Charts saved → {OUTPUT_DIR}/"))
         except Exception as e:
             print(C.yellow(f"  Chart error: {e}"))
+            if __debug__:
+                traceback.print_exc()
 
-    def _plot_attendance_dashboard(self):
-        """Main dashboard: bar chart + pie + stats."""
+    def _plot_dashboard(self):
         df = self.analytics.df_subjects
         if df is None or df.empty:
             return
 
         fig = plt.figure(figsize=(18, 10), facecolor=self.PALETTE["bg"])
-        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+        gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
 
-        # ── Main bar chart ────────────────────────────────────────────────
-        ax1 = fig.add_subplot(gs[0, :2])
-        colors = self._bar_colors(df["pct"].tolist())
-        bars = ax1.barh(df["short"], df["pct"], color=colors,
-                        edgecolor=self.PALETTE["grid"], height=0.65, linewidth=0.5)
-        ax1.axvline(x=75, color=self.PALETTE["warning"], linestyle="--", linewidth=1.5,
+        # ── horizontal bar chart ─────────────────────────────────────────
+        ax1    = fig.add_subplot(gs[0, :2])
+        colors = [self._bar_color(p) for p in df["pct"]]
+        bars   = ax1.barh(df["short"], df["pct"], color=colors, height=0.62,
+                          edgecolor=self.PALETTE["grid"], linewidth=0.4)
+        ax1.axvline(75, color=self.PALETTE["warning"], ls="--", lw=1.5,
                     label="75% threshold", alpha=0.8)
-        ax1.axvline(x=60, color=self.PALETTE["danger"], linestyle=":", linewidth=1,
-                    label="60% danger zone", alpha=0.6)
-
+        ax1.axvline(60, color=self.PALETTE["danger"],  ls=":",  lw=1.0,
+                    label="60% danger",    alpha=0.6)
         for bar, pct in zip(bars, df["pct"]):
-            ax1.text(min(bar.get_width() + 0.8, 108), bar.get_y() + bar.get_height() / 2,
-                     f"{pct:.1f}%", va="center", ha="left", fontsize=8.5,
-                     color=self.PALETTE["text"], fontweight="bold")
-
-        ax1.set_xlim(0, 112)
-        ax1.set_xlabel("Attendance %", fontsize=10)
+            ax1.text(min(bar.get_width() + 1, 108),
+                     bar.get_y() + bar.get_height() / 2,
+                     f"{pct:.1f}%", va="center", ha="left",
+                     fontsize=8, color=self.PALETTE["text"], fontweight="bold")
+        ax1.set_xlim(0, 113)
+        ax1.set_xlabel("Attendance %")
         ax1.set_title("Subject-wise Attendance", fontsize=13, fontweight="bold",
                       color=self.PALETTE["text"], pad=10)
-        ax1.legend(loc="lower right", fontsize=8, framealpha=0.3)
-        ax1.set_facecolor(self.PALETTE["surface"])
+        ax1.legend(fontsize=8, framealpha=0.3)
 
-        # ── Pie chart ─────────────────────────────────────────────────────
-        ax2 = fig.add_subplot(gs[0, 2])
-        subjects = list(self.data.subject_attendance.values())
-        tp = sum(s.present for s in subjects)
-        ta = sum(s.absent for s in subjects)
-        td = sum(s.duty_leave for s in subjects)
-        tm = sum(s.medical_leave for s in subjects)
-
-        pie_vals   = [v for v in [tp, ta, td, tm] if v > 0]
-        pie_labels = [l for v, l in zip([tp, ta, td, tm],
-                      ["Present", "Absent", "Duty", "Medical"]) if v > 0]
-        pie_colors = [self.PALETTE[c] for c, v in zip(
-                      ["safe","danger","warning","accent"], [tp, ta, td, tm]) if v > 0]
-
-        if pie_vals:
-            wedges, _, autotexts = ax2.pie(
-                pie_vals, labels=pie_labels, colors=pie_colors,
-                autopct="%1.0f%%", startangle=90,
+        # ── pie chart ────────────────────────────────────────────────────
+        ax2  = fig.add_subplot(gs[0, 2])
+        subs = list(self.data.subject_attendance.values())
+        tp   = sum(s.effective_present for s in subs)
+        ta   = sum(s.absent            for s in subs)
+        td   = sum(s.duty_leave        for s in subs)
+        vals = [v for v in [tp, ta, td] if v > 0]
+        lbls = [l for v, l in zip([tp, ta, td], ["Present", "Absent", "Duty"]) if v > 0]
+        cols = [self.PALETTE[c] for c, v in
+                zip(["safe", "danger", "warning"], [tp, ta, td]) if v > 0]
+        if vals:
+            _, _, auts = ax2.pie(
+                vals, labels=lbls, colors=cols, autopct="%1.0f%%",
+                startangle=90,
                 wedgeprops={"edgecolor": self.PALETTE["bg"], "linewidth": 2},
                 textprops={"color": self.PALETTE["text"], "fontsize": 8},
             )
-            for at in autotexts:
+            for at in auts:
                 at.set_color(self.PALETTE["bg"])
                 at.set_fontweight("bold")
+        tot = sum(vals) or 1
+        ax2.set_title(f"Overall: {round(tp/tot*100,1)}%", fontsize=12,
+                      fontweight="bold", color=self.PALETTE["text"])
 
-        total_all = sum(pie_vals) if pie_vals else 1
-        overall = round(tp / total_all * 100, 1)
-        ax2.set_title(f"Overall: {overall}%", fontsize=12, fontweight="bold",
-                      color=self.PALETTE["text"])
-        ax2.set_facecolor(self.PALETTE["surface"])
-
-        # ── Stacked present/absent ────────────────────────────────────────
+        # ── stacked bar ──────────────────────────────────────────────────
         ax3 = fig.add_subplot(gs[1, :2])
-        x = range(len(df))
-        ax3.bar(x, df["present"], label="Present ✅", color=self.PALETTE["safe"],
-                edgecolor=self.PALETTE["bg"], linewidth=0.5)
-        ax3.bar(x, df["absent"], bottom=df["present"], label="Absent ❌",
-                color=self.PALETTE["danger"], edgecolor=self.PALETTE["bg"], linewidth=0.5)
-        ax3.bar(x, df["duty"], bottom=df["present"] + df["absent"], label="Duty 🟡",
-                color=self.PALETTE["warning"], edgecolor=self.PALETTE["bg"], linewidth=0.5)
+        x   = range(len(df))
+        ax3.bar(x, df["present"], label="Present",
+                color=self.PALETTE["safe"],    edgecolor=self.PALETTE["bg"], lw=0.4)
+        ax3.bar(x, df["absent"], bottom=df["present"], label="Absent",
+                color=self.PALETTE["danger"],  edgecolor=self.PALETTE["bg"], lw=0.4)
+        ax3.bar(x, df["duty"],  bottom=df["present"] + df["absent"], label="Duty",
+                color=self.PALETTE["warning"], edgecolor=self.PALETTE["bg"], lw=0.4)
         ax3.set_xticks(list(x))
         ax3.set_xticklabels(df["short"], rotation=30, ha="right", fontsize=8)
         ax3.set_ylabel("Classes")
-        ax3.set_title("Present vs Absent vs Duty", fontsize=11, fontweight="bold",
+        ax3.set_title("Present / Absent / Duty", fontsize=11, fontweight="bold",
                       color=self.PALETTE["text"])
         ax3.legend(fontsize=8, framealpha=0.3)
-        ax3.set_facecolor(self.PALETTE["surface"])
 
-        # ── Stats summary box ─────────────────────────────────────────────
+        # ── stats box ────────────────────────────────────────────────────
         ax4 = fig.add_subplot(gs[1, 2])
         ax4.axis("off")
-        s = self.analytics.summary()
-        summary_text = (
+        s   = self.analytics.summary()
+        txt = (
             f"BUNK BUDGET 💤\n\n"
-            f"Total classes you\ncan still skip:\n\n"
-            f"  {s.get('total_can_bunk', 0):>4} classes\n\n"
-            f"GRIND REQUIRED 📚\n\n"
-            f"Classes needed to\nget everyone safe:\n\n"
-            f"  {s.get('total_need_attend', 0):>4} classes\n\n"
-            f"Subjects safe: {s.get('safe_count',0)}\n"
-            f"At risk:       {s.get('risky_count',0)}\n"
-            f"Danger zone:   {s.get('danger_count',0)}"
+            f"  {s.get('total_can_bunk',0):>5} classes\n\n"
+            f"GRIND NEEDED 📚\n\n"
+            f"  {s.get('total_need_attend',0):>5} classes\n\n"
+            f"Safe:    {s.get('safe_count',0)}\n"
+            f"At risk: {s.get('risky_count',0)}\n"
+            f"Danger:  {s.get('danger_count',0)}"
         )
-        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes,
-                 va="top", ha="left", fontsize=10, fontfamily="monospace",
-                 color=self.PALETTE["text"],
-                 bbox=dict(boxstyle="round,pad=0.5", facecolor=self.PALETTE["surface"],
-                           edgecolor=self.PALETTE["accent"], linewidth=1.5))
+        ax4.text(0.05, 0.95, txt, transform=ax4.transAxes, va="top", ha="left",
+                 fontsize=10, fontfamily="monospace", color=self.PALETTE["text"],
+                 bbox=dict(boxstyle="round,pad=0.5", fc=self.PALETTE["surface"],
+                           ec=self.PALETTE["accent"], lw=1.5))
 
         plt.suptitle(
             f"📊 {self.data.profile.display_name} — Attendance Report",
-            fontsize=14, fontweight="bold", color=self.PALETTE["text"], y=1.01
+            fontsize=14, fontweight="bold", color=self.PALETTE["text"], y=1.01,
         )
-
         path = OUTPUT_DIR / "attendance_dashboard.png"
         plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=self.PALETTE["bg"])
         plt.close()
+        print(C.dim(f"    → {path}"))
 
     def _plot_bunk_budget(self):
-        """Bunk budget bar chart."""
         df = self.analytics.df_subjects
         if df is None or df.empty:
             return
+        fig, ax = plt.subplots(figsize=(14, 5), facecolor=self.PALETTE["bg"])
+        ax.set_facecolor(self.PALETTE["surface"])
+        colors = [self.PALETTE["safe"] if v > 0 else self.PALETTE["danger"]
+                  for v in df["can_bunk"]]
+        ax.bar(df["short"], df["can_bunk"], color=colors,
+               edgecolor=self.PALETTE["bg"], lw=0.4)
+        ax.axhline(0, color=self.PALETTE["text"], lw=0.8)
+        for i, (val, sho) in enumerate(zip(df["can_bunk"], df["shortage"])):
+            if val == 0 and sho > 0:
+                ax.text(i, -0.4, f"−{sho}", ha="center", va="top",
+                        fontsize=8, color=self.PALETTE["danger"], fontweight="bold")
+        ax.set_title("Bunk Budget (green = can skip  |  red = already short)",
+                     fontsize=12, fontweight="bold", color=self.PALETTE["text"])
+        ax.set_ylabel("Classes")
+        plt.xticks(rotation=30, ha="right", fontsize=8)
+        plt.tight_layout()
+        path = OUTPUT_DIR / "bunk_budget.png"
+        plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=self.PALETTE["bg"])
+        plt.close()
+        print(C.dim(f"    → {path}"))
+
+    def _plot_series_marks(self):
+        """Bar chart of series exam marks per subject."""
+        if not self.data.series_results:
+            return
+        # Only sessional exams with numeric marks
+        sessionals = [
+            e for e in self.data.series_results
+            if "sessional" in e.category.lower() and e.percentage is not None
+        ]
+        if not sessionals:
+            return
+
+        subjects  = list(dict.fromkeys(e.subject_name for e in sessionals))
+        exam_nums = sorted(set(e.exam_label for e in sessionals))
+        x         = range(len(subjects))
+        width     = 0.35
+        colors    = [self.PALETTE["accent"], self.PALETTE["warning"]]
 
         fig, ax = plt.subplots(figsize=(14, 5), facecolor=self.PALETTE["bg"])
         ax.set_facecolor(self.PALETTE["surface"])
 
-        colors = [self.PALETTE["safe"] if v > 0 else self.PALETTE["danger"]
-                  for v in df["can_bunk"]]
-        ax.bar(df["short"], df["can_bunk"], color=colors,
-               edgecolor=self.PALETTE["bg"], linewidth=0.5)
-        ax.axhline(0, color=self.PALETTE["text"], linewidth=0.8)
+        for ei, enu in enumerate(exam_nums[:2]):   # max 2 exams per subject
+            vals = []
+            for subj in subjects:
+                match = next(
+                    (e for e in sessionals
+                     if e.subject_name == subj and e.exam_label == enu),
+                    None,
+                )
+                vals.append(match.percentage if match else 0)
+            offset = (ei - 0.5) * width
+            bars   = ax.bar(
+                [xi + offset for xi in x], vals,
+                width=width, label=f"Series {enu}",
+                color=colors[ei % len(colors)],
+                edgecolor=self.PALETTE["bg"], lw=0.4,
+            )
+            for bar, v in zip(bars, vals):
+                if v > 0:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 1,
+                        f"{v:.0f}%", ha="center", fontsize=7,
+                        color=self.PALETTE["text"],
+                    )
 
-        for i, (val, shortage) in enumerate(zip(df["can_bunk"], df["shortage"])):
-            if val == 0 and shortage > 0:
-                ax.text(i, -0.3, f"-{shortage}", ha="center", va="top",
-                        fontsize=8, color=self.PALETTE["danger"], fontweight="bold")
-
-        ax.set_title("Bunk Budget  💤  (green = can skip, red = already short)",
-                     fontsize=12, fontweight="bold", color=self.PALETTE["text"])
-        ax.set_ylabel("Classes can skip / short")
-        plt.xticks(rotation=30, ha="right", fontsize=8)
+        ax.axhline(50, color=self.PALETTE["danger"], ls="--", lw=1.2,
+                   label="50% pass line", alpha=0.7)
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(
+            [(s[:18] + "…") if len(s) > 18 else s for s in subjects],
+            rotation=25, ha="right", fontsize=8,
+        )
+        ax.set_ylabel("Score %")
+        ax.set_ylim(0, 110)
+        ax.set_title("Series Exam Scores", fontsize=12, fontweight="bold",
+                     color=self.PALETTE["text"])
+        ax.legend(fontsize=8, framealpha=0.3)
         plt.tight_layout()
-
-        path = OUTPUT_DIR / "bunk_budget.png"
+        path = OUTPUT_DIR / "series_marks.png"
         plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=self.PALETTE["bg"])
         plt.close()
+        print(C.dim(f"    → {path}"))
 
     def _plot_trend(self):
-        """Attendance trend over time (if record-level data available)."""
+        """Attendance trend line from date-view records."""
+        if not PANDAS_OK:
+            return
         df = self.analytics.df_records
         if df is None or df.empty or "date" not in df.columns:
             return
-
         try:
+            df = df.copy()
             df["date_parsed"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
             df = df.dropna(subset=["date_parsed"])
-            if df.empty:
+            if df.empty or len(df["date_parsed"].unique()) < 3:
                 return
 
-            daily = df.groupby("date_parsed").apply(
-                lambda g: (g["status"] == AttendanceStatus.PRESENT.value).mean() * 100
-            ).reset_index()
+            daily = (
+                df.groupby("date_parsed")
+                .apply(lambda g: (g["status"] == AttendanceStatus.PRESENT.value).mean() * 100)
+                .reset_index()
+            )
             daily.columns = ["date", "pct"]
             daily = daily.sort_values("date")
 
-            if len(daily) < 3:
-                return
-
             fig, ax = plt.subplots(figsize=(14, 4), facecolor=self.PALETTE["bg"])
             ax.set_facecolor(self.PALETTE["surface"])
-
-            ax.fill_between(daily["date"], daily["pct"], alpha=0.3, color=self.PALETTE["accent"])
+            ax.fill_between(daily["date"], daily["pct"], alpha=0.25,
+                            color=self.PALETTE["accent"])
             ax.plot(daily["date"], daily["pct"], color=self.PALETTE["accent"],
-                    linewidth=2, marker="o", markersize=3)
-            ax.axhline(75, color=self.PALETTE["warning"], linestyle="--",
-                       linewidth=1.5, label="75% threshold")
+                    lw=2, marker="o", ms=3)
+            ax.axhline(75, color=self.PALETTE["warning"], ls="--", lw=1.5,
+                       label="75% threshold")
 
-            # Trend line
             if SCIPY_OK and len(daily) > 5:
                 x_num = (daily["date"] - daily["date"].min()).dt.days.values
                 slope, intercept, *_ = scipy_stats.linregress(x_num, daily["pct"].values)
-                trend_y = slope * x_num + intercept
-                ax.plot(daily["date"], trend_y, color=self.PALETTE["danger"],
-                        linestyle=":", linewidth=1.5, label=f"Trend ({slope:+.2f}%/day)")
+                ax.plot(daily["date"], slope * x_num + intercept,
+                        color=self.PALETTE["danger"], ls=":", lw=1.5,
+                        label=f"Trend ({slope:+.2f}%/day)")
 
-            ax.set_title("Attendance Trend Over Time", fontsize=12,
-                         fontweight="bold", color=self.PALETTE["text"])
-            ax.set_ylabel("Daily Attendance %")
+            ax.set_title("Daily Attendance Trend", fontsize=12, fontweight="bold",
+                         color=self.PALETTE["text"])
+            ax.set_ylabel("Attendance %")
             ax.legend(fontsize=8, framealpha=0.3)
             plt.xticks(rotation=30, ha="right", fontsize=8)
             plt.tight_layout()
-
             path = OUTPUT_DIR / "attendance_trend.png"
             plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=self.PALETTE["bg"])
             plt.close()
-        except Exception as e:
-            pass  # trend plot is optional
+            print(C.dim(f"    → {path}"))
+        except Exception:
+            pass  # trend is optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2677,10 +2636,10 @@ class EtLabVisualizer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EtLabExporter:
-    """Export to JSON, CSV, and a markdown report."""
+    """Export to JSON, CSV, and Markdown."""
 
     def __init__(self, data: AcademicData, analytics: EtLabAnalytics):
-        self.data = data
+        self.data      = data
         self.analytics = analytics
 
     def export_all(self):
@@ -2689,66 +2648,103 @@ class EtLabExporter:
         self._export_markdown()
 
     def _export_json(self):
-        path = OUTPUT_DIR / "academic_data.json"
+        path    = OUTPUT_DIR / "academic_data.json"
         payload = {
             "scraped_at": self.data.scraped_at,
-            "profile": asdict(self.data.profile),
-            "summary": self.analytics.summary(),
-            "subjects": {name: sa.to_dict() for name, sa in self.data.subject_attendance.items()},
-            "results": [asdict(r) for r in self.data.results],
-            "timetable": [asdict(t) for t in self.data.timetable],
-            "errors": self.data.errors,
+            "profile":    asdict(self.data.profile),
+            "summary":    self.analytics.summary(),
+            "subjects":   {n: sa.to_dict() for n, sa in self.data.subject_attendance.items()},
+            "series_results": [asdict(r) for r in self.data.series_results],
+            "timetable":  [asdict(t) for t in self.data.timetable],
+            "errors":     self.data.errors,
         }
         path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        print(C.green(f"  📁 JSON: {path}"))
+        print(C.green(f"  📁 JSON : {path}"))
 
     def _export_csv(self):
-        if PANDAS_OK and self.analytics.df_subjects is not None and not self.analytics.df_subjects.empty:
-            p = OUTPUT_DIR / "attendance_summary.csv"
-            self.analytics.df_subjects.to_csv(p, index=False)
-            print(C.green(f"  📁 CSV:  {p}"))
+        if PANDAS_OK:
+            df = self.analytics.df_subjects
+            if df is not None and not df.empty:
+                p = OUTPUT_DIR / "attendance_summary.csv"
+                df.to_csv(p, index=False)
+                print(C.green(f"  📁 CSV  : {p}"))
 
-        if PANDAS_OK and self.analytics.df_records is not None and not self.analytics.df_records.empty:
-            p2 = OUTPUT_DIR / "attendance_records.csv"
-            self.analytics.df_records.to_csv(p2, index=False)
-            print(C.green(f"  📁 CSV:  {p2}"))
+            dr = self.analytics.df_records
+            if dr is not None and not dr.empty:
+                p2 = OUTPUT_DIR / "attendance_records.csv"
+                dr.to_csv(p2, index=False)
+                print(C.green(f"  📁 CSV  : {p2}"))
+
+        # Series results CSV (always)
+        if self.data.series_results:
+            p3 = OUTPUT_DIR / "series_results.csv"
+            lines = ["Category,Subject Code,Subject Name,Semester,Exam,Max Marks,Obtained,%"]
+            for e in self.data.series_results:
+                pct = str(e.percentage) if e.percentage is not None else ""
+                lines.append(
+                    f"{e.category},{e.subject_code},{e.subject_name},"
+                    f"{e.semester},{e.exam_label},{e.max_marks},{e.marks_obtained},{pct}"
+                )
+            p3.write_text("\n".join(lines), encoding="utf-8")
+            print(C.green(f"  📁 CSV  : {p3}"))
 
     def _export_markdown(self):
-        """Generate a nice markdown report."""
         path = OUTPUT_DIR / "attendance_report.md"
-        s = self.analytics.summary()
-        p = self.data.profile
+        s    = self.analytics.summary()
+        p    = self.data.profile
 
         lines = [
             f"# 🎓 Attendance Report — {p.display_name}",
-            f"**Generated:** {self.data.scraped_at[:19]}  ",
-            f"**Department:** {p.department}  |  **Semester:** {p.semester}",
+            f"**Generated:** {self.data.scraped_at[:19]}",
+            f"**College:** {p.college}  |  **Department:** {p.department}  |  "
+            f"**Semester:** {p.semester}",
             "",
-            "## 📊 Summary",
-            f"| Metric | Value |",
-            f"|--------|-------|",
+            "## 📊 Overall Summary",
+            "| Metric | Value |",
+            "|--------|-------|",
             f"| Overall Attendance | **{s.get('overall_pct', 0)}%** |",
             f"| Total Classes | {s.get('total_classes', 0)} |",
             f"| Present | {s.get('total_present', 0)} |",
             f"| Absent | {s.get('total_absent', 0)} |",
             f"| Safe Subjects | {s.get('safe_count', 0)} |",
             f"| At Risk | {s.get('risky_count', 0)} |",
-            f"| Total Bunk Budget | **{s.get('total_can_bunk', 0)} classes** |",
+            f"| Bunk Budget | **{s.get('total_can_bunk', 0)} classes** |",
+            f"| Need to Attend | **{s.get('total_need_attend', 0)} classes** |",
             "",
-            "## 📋 Subject-wise",
-            "| Subject | Code | % | Status | Bunk Left | Need Attend |",
-            "|---------|------|---|--------|-----------|-------------|",
+            "## 📋 Subject-wise Attendance",
+            "| Subject | Code | Present | Total | % | Status | Bunk Left | Need |",
+            "|---------|------|---------|-------|---|--------|-----------|------|",
         ]
 
-        for name, sa in sorted(self.data.subject_attendance.items(), key=lambda x: x[1].percentage):
+        for name, sa in sorted(
+            self.data.subject_attendance.items(),
+            key=lambda x: x[1].percentage,
+        ):
             status = "✅ Safe" if sa.is_safe else ("💀 Danger" if sa.is_danger else "⚠️ Risk")
-            bunk = str(sa.classes_can_bunk) if sa.is_safe else "-"
-            need = str(sa.classes_to_attend) if not sa.is_safe else "-"
-            lines.append(f"| {name[:40]} | {sa.code} | {sa.percentage}% | {status} | {bunk} | {need} |")
+            bunk   = str(sa.classes_can_bunk)  if sa.is_safe     else "-"
+            need   = str(sa.classes_to_attend) if not sa.is_safe else "-"
+            lines.append(
+                f"| {name[:40]} | {sa.code} | {sa.effective_present} | "
+                f"{sa.total_classes} | {sa.percentage}% | {status} | {bunk} | {need} |"
+            )
 
-        lines += ["", "---", "*Generated by EtLab Pro — your attendance bestie 🎓*"]
+        if self.data.series_results:
+            lines += [
+                "",
+                "## 📝 Series Exam Results",
+                "| Category | Subject | Exam | Max | Obtained | % |",
+                "|----------|---------|------|-----|----------|---|",
+            ]
+            for e in self.data.series_results:
+                pct = f"{e.percentage}%" if e.percentage is not None else "-"
+                lines.append(
+                    f"| {e.category} | {e.subject_name[:35]} | {e.exam_label} | "
+                    f"{e.max_marks} | {e.marks_obtained} | {pct} |"
+                )
+
+        lines += ["", "---", "*Generated by EtLab Pro v4.0 — your attendance bestie 🎓*"]
         path.write_text("\n".join(lines), encoding="utf-8")
-        print(C.green(f"  📁 MD:   {path}"))
+        print(C.green(f"  📁 MD   : {path}"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2757,25 +2753,29 @@ class EtLabExporter:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="EtLab Pro — Your Attendance Bestie 🎓",
+        description="EtLab Pro v4.0 — Your Attendance Bestie 🎓",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python etlab_scraper.py -u 925059 -p 6a014a
-          python etlab_scraper.py -u 925059 -p 6a014a --show-browser
-          python etlab_scraper.py -u 925059 -p 6a014a --no-charts --no-export
-          python etlab_scraper.py -u 925059 -p 6a014a --what-if
+          python main1.py -u 925059 -p 6a014a
+          python main1.py -u 925059 -p 6a014a --show-browser --debug
+          python main1.py -u 925059 -p 6a014a --no-cache --no-charts
+          python main1.py -u 925059 -p 6a014a --what-if
+          python main1.py -u 925059 -p 6a014a --calendar "MATHEMATICS"
+          python main1.py -u 925059 -p 6a014a --semester 2
         """),
     )
-    p.add_argument("-u", "--username", required=True,      help="EtLab student ID / username")
-    p.add_argument("-p", "--password", required=True,      help="EtLab password")
-    p.add_argument("--show-browser",  action="store_true", help="Show browser window (debug)")
-    p.add_argument("--no-cache",      action="store_true", help="Clear and ignore cached pages")
-    p.add_argument("--no-charts",     action="store_true", help="Skip chart generation")
-    p.add_argument("--no-export",     action="store_true", help="Skip JSON/CSV/MD export")
-    p.add_argument("--what-if",       action="store_true", help="Run interactive what-if simulator")
-    p.add_argument("--debug",         action="store_true", help="Enable debug logging")
-    p.add_argument("-o", "--output",  default="etlab_output", help="Output directory")
+    p.add_argument("-u", "--username",   required=True,       help="EtLab student ID")
+    p.add_argument("-p", "--password",   required=True,       help="EtLab password")
+    p.add_argument("--show-browser",     action="store_true", help="Show browser window")
+    p.add_argument("--no-cache",         action="store_true", help="Clear cache before run")
+    p.add_argument("--no-charts",        action="store_true", help="Skip chart generation")
+    p.add_argument("--no-export",        action="store_true", help="Skip file exports")
+    p.add_argument("--what-if",          action="store_true", help="Interactive what-if simulator")
+    p.add_argument("--calendar",         metavar="SUBJECT",   help="Show ASCII attendance calendar")
+    p.add_argument("--debug",            action="store_true", help="Verbose debug logging")
+    p.add_argument("--semester",         type=int, default=0, help="Semester number (0 = auto)")
+    p.add_argument("-o", "--output",     default="etlab_output", help="Output directory")
     return p.parse_args()
 
 
@@ -2794,11 +2794,8 @@ def main():
     )
 
     if not PLAYWRIGHT_OK:
-        log.critical("Playwright is required. Install with:")
-        log.critical("  pip install playwright")
-        log.critical("  playwright install chromium")
+        log.critical("Playwright required: pip install playwright && playwright install chromium")
         sys.exit(1)
-
     if not BS4_OK:
         log.critical("beautifulsoup4 required: pip install beautifulsoup4 lxml")
         sys.exit(1)
@@ -2809,6 +2806,7 @@ def main():
         password=args.password,
         headless=not args.show_browser,
         no_cache=args.no_cache,
+        semester=args.semester,
         log=log,
     )
     data = scraper.scrape_all()
@@ -2820,7 +2818,11 @@ def main():
     display = EtLabDisplay(data, analytics)
     display.show_all()
 
-    # ── WHAT-IF ───────────────────────────────────────────────────────────
+    # ── OPTIONAL ASCII CALENDAR ───────────────────────────────────────────
+    if args.calendar and data.subject_attendance:
+        display.show_ascii_calendar(args.calendar)
+
+    # ── OPTIONAL WHAT-IF ──────────────────────────────────────────────────
     if args.what_if and data.subject_attendance:
         display.interactive_what_if()
 
@@ -2831,25 +2833,26 @@ def main():
 
     # ── EXPORT ────────────────────────────────────────────────────────────
     if not args.no_export:
-        print(C.bold(C.cyan("\n  📦 Exporting data...\n")))
-        exporter = EtLabExporter(data, analytics)
-        exporter.export_all()
+        print(C.bold(C.cyan("\n  📦 Exporting…\n")))
+        EtLabExporter(data, analytics).export_all()
 
-    # ── FINAL STATUS ──────────────────────────────────────────────────────
+    # ── FINAL VERDICT ─────────────────────────────────────────────────────
     s = analytics.summary()
     if s:
         pct = s["overall_pct"]
-        msg = C.green("You're doing great, keep it up! ✨") if pct >= 75 else \
-              C.red("Bro please start attending 💀")
-        print(f"\n  {msg}")
+        if pct >= 75:
+            print(C.green(f"\n  ✨ Overall {pct}% — you're doing great! Keep it up."))
+        elif pct >= 60:
+            print(C.yellow(f"\n  ⚠️  Overall {pct}% — borderline. Attend more consistently."))
+        else:
+            print(C.red(f"\n  💀 Overall {pct}% — seriously bro, start attending."))
     else:
         print(C.yellow("\n  ⚠️  No attendance data found."))
-        print(C.dim("  Saved debug HTML files in etlab_output/ — open them in Chrome"))
-        print(C.dim("  to see what the server is actually returning."))
-        print(C.dim("  Also check etlab_output/debug_login.png for login screenshot."))
+        print(C.dim("  Open etlab_output/debug_attendance_subject.html in a browser"))
+        print(C.dim("  to inspect what the server returned."))
 
-    print(C.dim(f"\n  Log: {LOG_FILE}"))
-    print(C.dim(f"  Output: {OUTPUT_DIR}/\n"))
+    print(C.dim(f"\n  Log    : {LOG_FILE}"))
+    print(C.dim(f"  Output : {OUTPUT_DIR}/\n"))
 
 
 if __name__ == "__main__":
